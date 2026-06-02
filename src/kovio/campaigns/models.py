@@ -18,6 +18,18 @@ from typing import Any
 from ..types import SceneState, TaskState
 
 
+# Symbolic operators (as emitted by the cloud API) → the SDK's canonical names.
+# Local campaigns.json uses the canonical names directly; both vocabularies work.
+_OP_ALIASES = {
+    ">=": "gte", "≥": "gte",
+    "<=": "lte", "≤": "lte",
+    ">": "gt",
+    "<": "lt",
+    "==": "eq", "=": "eq",
+    "!=": "ne", "≠": "ne",
+}
+
+
 @dataclass(frozen=True)
 class TargetingRule:
     """One predicate. AND-combined with other rules on the same campaign."""
@@ -30,11 +42,15 @@ class TargetingRule:
         actual = ctx.get(self.field)
         if actual is None:
             return False
-        op, v = self.op, self.value
+        op, v = _OP_ALIASES.get(self.op, self.op), self.value
         if op == "gte":
             return actual >= v
         if op == "lte":
             return actual <= v
+        if op == "gt":
+            return actual > v
+        if op == "lt":
+            return actual < v
         if op == "eq":
             return actual == v
         if op == "ne":

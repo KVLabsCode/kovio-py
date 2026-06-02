@@ -170,10 +170,11 @@ class BrowserScreenAdapter(ScreenAdapter):
         with self._lock:
             showing = self._showing
             creative = self._creative_url
-        # Local file:// creatives are proxied through /creative so the iframe
-        # can load them same-origin; http(s) creatives are framed directly.
+        # Remote http(s) creatives are framed directly; everything local
+        # (file:// or a relative/absolute path, e.g. a cloud campaign's
+        # "creatives/x.html") is proxied through /creative so it loads same-origin.
         if showing and creative:
-            src = "/creative" if creative.startswith("file:") else creative
+            src = creative if _is_remote(creative) else "/creative"
         else:
             src = None
         return {
@@ -217,12 +218,21 @@ class BrowserScreenAdapter(ScreenAdapter):
         }
 
     def _creative_bytes(self) -> bytes | None:
-        """Read the current local creative's HTML for the /creative proxy."""
+        """Read the current local creative's HTML for the /creative proxy.
+
+        Handles both file:// URLs and bare paths. A relative path (as cloud
+        campaigns use, e.g. "creatives/kovio_brand.html") resolves against the
+        process's working directory — the same place the robot keeps its
+        bundled creatives.
+        """
         with self._lock:
             creative = self._creative_url
-        if not creative or not creative.startswith("file:"):
+        if not creative or _is_remote(creative):
             return None
-        path = Path(unquote(urlparse(creative).path))
+        if creative.startswith("file:"):
+            path = Path(unquote(urlparse(creative).path))
+        else:
+            path = Path(creative)
         try:
             return path.read_bytes()
         except OSError as e:
@@ -324,6 +334,11 @@ class BrowserScreenAdapter(ScreenAdapter):
             self._httpd.shutdown()
             self._httpd.server_close()
             self._httpd = None
+
+
+def _is_remote(url_or_path: str) -> bool:
+    """True for http(s) creatives (framed directly), False for local files."""
+    return url_or_path.startswith("http://") or url_or_path.startswith("https://")
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):

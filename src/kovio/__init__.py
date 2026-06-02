@@ -6,7 +6,7 @@ from .adapters.perception import PerceptionAdapter
 from .cloud import CloudCampaignStore, CloudEventSink
 from .config import CloudConfig, load_cloud_config
 
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 __all__ = [
     "KovioAgent",
