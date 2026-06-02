@@ -50,17 +50,69 @@ def _extra_hint(adapter_name: str) -> str:
     return "kovio[dev]"
 
 
+DEMO_PORT = 8001
+
+
 def cmd_demo(args) -> int:
-    """Run the SDK with mock perception — works on any laptop."""
+    """Run the SDK with mock perception and a browser-viewable screen.
+
+    Unlike `serve`, the demo doesn't spawn a kiosk browser — it serves the
+    robot screen at http://localhost:8001 for you to open. An attention gate
+    keeps the screen idle until the (scripted) mock perception reports someone
+    looking, at which point the default creative goes up with a save QR. Tap it
+    to record an engagement.
+    """
     import os
+
+    from .adapters.screen import BrowserScreenAdapter
+    from .types import GateDecision
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     os.environ["KOVIO_PERCEPTION"] = "mock"
-    return cmd_serve(args)
+
+    db_path = "kovio.db"
+    screen = BrowserScreenAdapter(db_path=db_path, robot_id=args.robot_id, port=DEMO_PORT)
+    agent = KovioAgent.autodetect(robot_id=args.robot_id, screen=screen, db_path=db_path)
+
+    @agent.task_gate
+    def _attention_gate(task_state, scene) -> GateDecision:
+        # Demo storyline: only surface a creative when someone is actually
+        # attending the screen. Idle wordmark the rest of the time.
+        if scene and scene.attended_count > 0:
+            return GateDecision.allow()
+        return GateDecision.suppress("no_attention")
+
+    _print_demo_banner(DEMO_PORT)
+    return _run_agent(agent)
+
+
+def _print_demo_banner(port: int) -> None:
+    lines = [
+        "kovio demo — robot screen is live",
+        "",
+        f"Open  http://localhost:{port}  in your browser.",
+        "It breathes a wordmark while idle, then plays the",
+        "creative when the mock perception reports attention.",
+        "Tap the creative to record an engagement.",
+        "",
+        "Ctrl-C to stop.",
+    ]
+    width = max(len(s) for s in lines) + 4
+    top = "  ┌" + "─" * width + "┐"
+    bottom = "  └" + "─" * width + "┘"
+    body = "\n".join(f"  │  {s:<{width - 4}}  │" for s in lines)
+    print(f"\n{top}\n{body}\n{bottom}\n")
 
 
 def cmd_serve(args) -> int:
     """Run the SDK with platform-detected adapters."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     agent = KovioAgent.autodetect(robot_id=args.robot_id)
+    return _run_agent(agent)
+
+
+def _run_agent(agent: KovioAgent) -> int:
+    """Start the agent and block until Ctrl-C, then shut it down cleanly."""
     agent.start()
     log.info("Agent running. Press Ctrl-C to stop.")
     try:
