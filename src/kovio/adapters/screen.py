@@ -183,6 +183,39 @@ class BrowserScreenAdapter(ScreenAdapter):
             "qr_svg": self._qr_svg,
         }
 
+    def _current_json(self) -> dict:
+        """What's on screen right now, enriched with the live campaign (if any).
+
+        `state` is "playing" / "idle"; when playing, `campaign_id` / `advertiser`
+        come from the most recent `ad_played` event. They stay null for the
+        bundled default creative (its play event carries no campaign), which is
+        exactly how you tell a real cloud campaign from the local fallback.
+        """
+        with self._lock:
+            showing = self._showing
+            creative = self._creative_url
+        campaign_id = advertiser = None
+        if showing:
+            try:
+                conn = sqlite3.connect(str(self._db_path))
+                row = conn.execute(
+                    "SELECT payload_json FROM events WHERE event_type='ad_played' "
+                    "ORDER BY timestamp DESC LIMIT 1"
+                ).fetchone()
+                conn.close()
+                if row:
+                    p = json.loads(row[0])
+                    campaign_id = p.get("campaign_id")
+                    advertiser = p.get("advertiser")
+            except sqlite3.Error:
+                pass
+        return {
+            "state": "playing" if showing else "idle",
+            "creative_url": creative if showing else None,
+            "campaign_id": campaign_id,
+            "advertiser": advertiser,
+        }
+
     def _creative_bytes(self) -> bytes | None:
         """Read the current local creative's HTML for the /creative proxy."""
         with self._lock:
@@ -252,6 +285,8 @@ class BrowserScreenAdapter(ScreenAdapter):
                     self._send(200, PAGE_HTML.encode(), "text/html; charset=utf-8")
                 elif route == "/api/state":
                     self._send(200, json.dumps(adapter._state_json()).encode(), "application/json")
+                elif route == "/api/current":
+                    self._send(200, json.dumps(adapter._current_json()).encode(), "application/json")
                 elif route == "/creative":
                     body = adapter._creative_bytes()
                     if body is None:

@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.0.8 — Cloud connectivity
+
+- New `kovio.config.CloudConfig` reads cloud URL + API key from env vars
+- Optional `.env` file support (no python-dotenv dependency — built-in parser)
+- `KovioAgent.autodetect()` now constructs `CloudCampaignStore` + `CloudEventSink`
+  automatically when `KOVIO_API_URL` and `KOVIO_API_KEY` are present
+- `kovio doctor` shows cloud configuration + reachability (`/healthz` probe)
+- `BrowserScreenAdapter` adds `/api/current` (state + live campaign id/advertiser)
+- Backward compatible: SDK falls back to default_creative.html if env vars are unset
+- Fixed: `agent_started` event payload now reads version from `kovio.__version__`
+  instead of a hardcoded string (was `0.0.3`)
+
+## 0.0.7 — Browser demo screen
 
 - `kovio demo` now serves a browser-viewable robot screen at
   http://localhost:8001 instead of only logging creative URLs. Idle shows a

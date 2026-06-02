@@ -71,6 +71,74 @@ KOVIO_SCREEN=logger kovio serve           # Log creative URLs instead of opening
 
 PyPI release is gated on the v0.1 release. For now, install from this repo at a tag.
 
+## Connecting to your kovio cloud
+
+The SDK works out of the box with a bundled default creative — useful for testing the install. To pull *real* campaigns from your kovio cloud, set two environment variables:
+
+```bash
+export KOVIO_API_URL="https://kovio-api.fly.dev"
+export KOVIO_API_KEY="kov_live_<your_sdk_key>"
+```
+
+You can get your SDK API key from:
+
+- The OEM portal → your fleet detail page → "Generate API key"
+- Or the admin API: `POST /admin/v1/api-keys` with your admin token
+
+Verify the connection:
+
+```bash
+kovio doctor
+# Should show:
+#   Cloud API URL:    https://kovio-api.fly.dev
+#   Cloud API key:    kov_live_xxxx••••
+#   Cloud reachable:  HTTP 200
+```
+
+Then run as usual:
+
+```bash
+kovio demo    # mock perception, pulling real campaigns from cloud
+kovio serve   # platform-detected perception, pulling real campaigns from cloud
+```
+
+### Using a .env file instead of shell exports
+
+For dev convenience, drop a `.env` file in the directory where you run `kovio` (copy `.env.example`):
+
+```
+# .env
+KOVIO_API_URL=https://kovio-api.fly.dev
+KOVIO_API_KEY=kov_live_...
+KOVIO_ROBOT_ID=my-laptop-test
+```
+
+Existing shell env vars take precedence over `.env` values. (`.env` is git-ignored — never commit credentials.)
+
+### For systemd / kiosk deploys
+
+Put env vars in the systemd unit file:
+
+```ini
+[Service]
+Environment="KOVIO_API_URL=https://kovio-api.fly.dev"
+Environment="KOVIO_API_KEY=kov_live_..."
+Environment="KOVIO_ROBOT_ID=tank-001"
+ExecStart=/usr/local/bin/kovio serve
+```
+
+### Optional tuning
+
+| Variable | Default | What it does |
+|---|---|---|
+| `KOVIO_ROBOT_ID` | hostname | This robot's identifier in your event stream |
+| `KOVIO_API_TIMEOUT` | 8.0 | Seconds before an API call gives up (used by `kovio doctor`'s probe) |
+| `KOVIO_CAMPAIGN_TTL` | 300 | Seconds between campaign refreshes from cloud |
+
+### What happens if the cloud is unreachable?
+
+The SDK logs a warning and continues running. New campaigns won't appear until the cloud comes back, but the locally-cached campaigns keep playing and events buffer to SQLite (and upload when the cloud is reachable again).
+
 ## Three things you should know before going further
 
 **On-device by construction.** All perception runs on the robot. Camera frames are never transmitted, logged, or persisted. The SDK accepts only derived `SceneState` events (counts and aggregates). The cloud never sees images. This is enforced in the type system, not by convention.

@@ -84,3 +84,46 @@ Decisions made adding the browser-viewable `kovio demo` screen.
   `kovio demo` builds it explicitly and passes `screen=` to `autodetect()`.
 - **Local `file://` creatives are proxied via `/creative`** so the page can frame
   them same-origin; `http(s)` creatives are framed directly.
+
+# Cloud connectivity (0.0.8)
+
+Decisions made wiring `CloudCampaignStore` / `CloudEventSink` into `autodetect()`.
+
+- **`CloudCampaignStore` / `CloudEventSink` were NOT modified — only their
+  construction site.** The prompt's sketch passed `timeout=config.api_timeout_seconds`
+  to both, but neither class accepts a `timeout` kwarg (they call the module-level
+  `_post_json`/`_get_json`, which use `cloud._DEFAULT_TIMEOUT = 8.0`). Per the hard
+  rule not to touch those classes, the constructors are called with only their real
+  params. Consequence: **`KOVIO_API_TIMEOUT` currently affects only `kovio doctor`'s
+  `/healthz` probe**, not the store/sink network calls. Honoring it there too would
+  require a (deferred) change to `cloud.py`.
+- **A cloud `store` becomes a `RuleBasedSelector` inside `KovioAgent.__init__`.**
+  The agent plays via a *selector*, not a store, so `autodetect()` hands the store
+  to `__init__`, which wraps it in the default `RuleBasedSelector` unless an explicit
+  `selector=` was given. With no store and no selector, the fixed `creative_url`
+  (default creative) path is untouched — that's the backward-compatible local mode.
+- **Cloud mode shows real campaigns or nothing — never the default creative.** When
+  a selector is present but returns no eligible campaign, the agent suppresses (idle)
+  rather than falling back to `creative_url`. So with the cloud configured you see
+  your campaigns (or a blank screen if none are eligible / cache is empty), which is
+  the intended "no more default_creative.html" behavior. The default creative only
+  appears in local (no-selector) mode.
+- **CLI `--robot-id` default changed from `"tank-001"` to `None`.** Otherwise the CLI
+  always passed an explicit id and `KOVIO_ROBOT_ID` / hostname could never apply.
+  Resolution order is now: `--robot-id` flag > `KOVIO_ROBOT_ID` > hostname. The only
+  observable change in the no-env path is the default robot id label (hostname instead
+  of `tank-001`) — a label in the event stream, not a behavior change.
+- **`agent.py` reads `__version__` via a lazy `from . import __version__`** inside
+  `start()`, not a top-level import — the package `__init__` imports `.agent`, so a
+  module-level import would be circular. By the time `start()` runs the package is
+  fully initialized.
+- **`load_cloud_config()` is called twice on the `kovio demo` path** (once in
+  `cmd_demo` to resolve the shared robot id for the screen + agent, once inside
+  `autodetect`). It's idempotent (`.env` only fills unset vars; shell env wins), so
+  the only cost is a duplicated info log line. Accepted rather than threading a
+  pre-built config through `autodetect`'s signature.
+- **`/api/current` reads the latest `ad_played` from SQLite** for `campaign_id` /
+  `advertiser` rather than plumbing campaign metadata through `ScreenAdapter.display()`
+  (which takes only a URL). Keeps the adapter interface unchanged; campaign fields are
+  null for the default creative (its play event carries no campaign), which is the
+  signal distinguishing a cloud campaign from the local fallback.
