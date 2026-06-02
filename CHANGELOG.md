@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.9 — Cloud campaign fixes (live-verified against production)
+
+- **Targeting now accepts the cloud's symbolic operators** (`>=`, `<=`, `>`, `<`,
+  `==`, `!=`) in addition to the named ones (`gte`, `lte`, …). Cloud campaigns
+  were silently never matching because the API emits `>=` while the SDK only
+  understood `gte`.
+- **`CloudCampaignStore` / `CloudEventSink` honor a `timeout`**, wired from
+  `KOVIO_API_TIMEOUT`. The hardcoded 8s default was too tight for a backlog batch
+  against a cold/slow server, so event uploads silently failed; the timeout is now
+  configurable end-to-end.
+- **`BrowserScreenAdapter` renders relative-path creatives** (e.g. a cloud
+  campaign's `creatives/x.html`) by serving them from the working directory via
+  `/creative`. Previously only `file://` creatives rendered.
+- Added the `creatives/kovio_brand.html` brand creative.
+- Removed an unused import in `cloud.py`.
+
 ## 0.0.8 — Cloud connectivity
 
 - New `kovio.config.CloudConfig` reads cloud URL + API key from env vars

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Kovio — Brand Awareness</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    body {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: radial-gradient(circle at 30% 25%, #f7f2e6 0%, #f2ecdc 55%, #ece4cf 100%);
+      color: #1c1a18; text-align: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    }
+    .tag {
+      font-size: 13px; letter-spacing: .18em; text-transform: uppercase;
+      color: #9f5e2a; margin-bottom: 18px;
+    }
+    .tag .dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: #c57a3f; margin-right: 9px; vertical-align: middle;
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(1.35); } }
+    .wordmark {
+      font-family: "Instrument Serif", Georgia, serif; font-style: italic;
+      font-size: clamp(72px, 16vw, 200px); line-height: 1; margin: 0 0 8px;
+    }
+    h1 {
+      font-size: clamp(28px, 5vw, 52px); font-weight: 600;
+      letter-spacing: -0.02em; margin: 6px 0 14px;
+    }
+    p { font-size: clamp(16px, 2.4vw, 22px); color: #5f574a; margin: 0; max-width: 22ch; }
+  </style>
+</head>
+<body>
+  <div class="tag"><span class="dot"></span>Kovio · live</div>
+  <div class="wordmark">kovio</div>
+  <h1>The future, rolling.</h1>
+  <p>This robot is part of the Kovio network.</p>
+</body>
+</html>

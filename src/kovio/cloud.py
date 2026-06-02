@@ -18,7 +18,6 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
 from pathlib import Path
 from urllib import error, request
 
@@ -83,11 +82,13 @@ class CloudCampaignStore:
         api_key: str,
         db_path: str | Path = "kovio.db",
         ttl_seconds: int = 300,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.db_path = Path(db_path)
         self.ttl_seconds = ttl_seconds
+        self.timeout = timeout
 
         self._campaigns: list[Campaign] = []
         self._fetched_at: float = 0.0
@@ -131,6 +132,7 @@ class CloudCampaignStore:
         status, payload = _get_json(
             f"{self.api_url}/sdk/v1/campaigns",
             headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
         )
         if status == 200 and payload:
             raw_campaigns = payload.get("campaigns", [])
@@ -187,6 +189,7 @@ class CloudEventSink:
         robot_id: str = "",
         flush_interval_seconds: float = 30.0,
         batch_size: int = 100,
+        timeout: float = _DEFAULT_TIMEOUT,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -194,6 +197,7 @@ class CloudEventSink:
         self.robot_id = robot_id
         self.flush_interval = flush_interval_seconds
         self.batch_size = batch_size
+        self.timeout = timeout
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -277,6 +281,7 @@ class CloudEventSink:
             f"{self.api_url}/sdk/v1/events/batch",
             {"events": events},
             headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
         )
 
         if status == 200 and payload:

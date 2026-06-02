@@ -132,7 +132,7 @@ ExecStart=/usr/local/bin/kovio serve
 | Variable | Default | What it does |
 |---|---|---|
 | `KOVIO_ROBOT_ID` | hostname | This robot's identifier in your event stream |
-| `KOVIO_API_TIMEOUT` | 8.0 | Seconds before an API call gives up (used by `kovio doctor`'s probe) |
+| `KOVIO_API_TIMEOUT` | 8.0 | Seconds before a cloud call gives up (campaign fetch, event upload, doctor probe) — raise it on a slow link |
 | `KOVIO_CAMPAIGN_TTL` | 300 | Seconds between campaign refreshes from cloud |
 
 ### What happens if the cloud is unreachable?

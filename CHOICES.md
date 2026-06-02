@@ -89,14 +89,10 @@ Decisions made adding the browser-viewable `kovio demo` screen.
 
 Decisions made wiring `CloudCampaignStore` / `CloudEventSink` into `autodetect()`.
 
-- **`CloudCampaignStore` / `CloudEventSink` were NOT modified — only their
-  construction site.** The prompt's sketch passed `timeout=config.api_timeout_seconds`
-  to both, but neither class accepts a `timeout` kwarg (they call the module-level
-  `_post_json`/`_get_json`, which use `cloud._DEFAULT_TIMEOUT = 8.0`). Per the hard
-  rule not to touch those classes, the constructors are called with only their real
-  params. Consequence: **`KOVIO_API_TIMEOUT` currently affects only `kovio doctor`'s
-  `/healthz` probe**, not the store/sink network calls. Honoring it there too would
-  require a (deferred) change to `cloud.py`.
+- **`CloudCampaignStore` / `CloudEventSink` construction.** `autodetect()` builds
+  these from `CloudConfig`. (In 0.0.8 they took only their original params and
+  `KOVIO_API_TIMEOUT` reached just the `doctor` probe; 0.0.9 added a `timeout`
+  param to both so it flows into every cloud call — see below.)
 - **A cloud `store` becomes a `RuleBasedSelector` inside `KovioAgent.__init__`.**
   The agent plays via a *selector*, not a store, so `autodetect()` hands the store
   to `__init__`, which wraps it in the default `RuleBasedSelector` unless an explicit
@@ -127,3 +123,31 @@ Decisions made wiring `CloudCampaignStore` / `CloudEventSink` into `autodetect()
   (which takes only a URL). Keeps the adapter interface unchanged; campaign fields are
   null for the default creative (its play event carries no campaign), which is the
   signal distinguishing a cloud campaign from the local fallback.
+
+# Cloud campaign fixes (0.0.9)
+
+Found by connecting `kovio demo` to the live `kovio-api.fly.dev` with a real SDK key.
+
+- **Symbolic targeting operators.** The production API returns targeting rules like
+  `{"op": ">=", "field": "person_count", "value": 1}`, but `TargetingRule.evaluate`
+  only recognized named ops (`gte`, `lte`, …) and silently returned `False` for
+  anything else — so *every* cloud campaign failed to match and nothing ever played.
+  Added an `_OP_ALIASES` map (`>=`→`gte`, `<=`→`lte`, `>`→`gt`, `<`→`lt`, `==`/`=`→`eq`,
+  `!=`→`ne`) and `gt`/`lt` branches. Local `campaigns.json` (named ops) is unaffected.
+- **`timeout` on `CloudCampaignStore` / `CloudEventSink`.** The fly server takes
+  ~6.5s to accept a 20-event batch (cold), so the hardcoded 8s timeout failed the
+  sink's 100-event backlog drains — uploads silently stalled. Both classes now take a
+  `timeout` (default unchanged at `_DEFAULT_TIMEOUT`) threaded into `_get_json`/
+  `_post_json`, fed from `KOVIO_API_TIMEOUT`. The `.env` for the demo sets `30`.
+  `batch_size` left at 100 — a clean robot's batches are small; the timeout is the
+  real lever for a slow link.
+- **Relative-path creatives render.** A cloud campaign's `creative_path` is a bare
+  relative path (`creatives/kovio_brand.html`) the robot is expected to have on disk,
+  not a URL — and the API does not serve it. `BrowserScreenAdapter` now routes any
+  non-`http(s)` creative through `/creative`, resolving file:// **and** relative/
+  absolute local paths against the working directory. Shipped `creatives/kovio_brand.html`
+  (Kovio's own brand ad) so the bundled cloud campaign renders out of the box.
+- **Cloud mode is "real campaigns or idle."** Confirmed live: with the cloud
+  configured the screen idles until a campaign both passes the demo attention gate and
+  matches its targeting, then plays the real creative — it never shows the local
+  default. (That's local-only mode.)

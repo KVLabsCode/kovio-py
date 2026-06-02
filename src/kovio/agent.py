@@ -114,6 +114,7 @@ class KovioAgent:
                 api_key=config.api_key,
                 db_path=db_path,
                 ttl_seconds=config.campaign_ttl_seconds,
+                timeout=config.api_timeout_seconds,
             )
 
         if config.is_configured and sink is None:
@@ -123,6 +124,7 @@ class KovioAgent:
                 api_key=config.api_key,
                 db_path=db_path,
                 robot_id=effective_robot_id,
+                timeout=config.api_timeout_seconds,
             )
 
         perception = kwargs.pop("perception", None) or make_perception_adapter()

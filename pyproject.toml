@@ -1,6 +1,6 @@
 [project]
 name = "kovio"
-version = "0.0.8"
+version = "0.0.9"
 description = "Advertising SDK for robots with screens."
 readme = "README.md"
 license = { text = "MIT" }
