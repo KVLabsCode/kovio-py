@@ -18,10 +18,32 @@ def cmd_doctor(args) -> int:
     """Print platform info — useful for debugging install issues."""
     import importlib.util
 
+    from .config import load_cloud_config
+
     plat = detect_platform()
     chromium = find_chromium() or "(not found)"
     print(f"Platform:            {plat.value}")
     print(f"Chromium binary:     {chromium}")
+
+    config = load_cloud_config()
+    if config.is_configured:
+        print(f"Cloud API URL:       {config.api_url}")
+        print(f"Cloud API key:       {config.api_key_redacted}")
+        print(f"Robot ID:            {config.robot_id}")
+        # Best-effort reachability probe — never fatal.
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"{config.api_url.rstrip('/')}/healthz",
+                headers={"Authorization": f"Bearer {config.api_key}"},
+            )
+            with urllib.request.urlopen(req, timeout=config.api_timeout_seconds) as r:
+                print(f"Cloud reachable:     HTTP {r.status}")
+        except Exception as e:  # noqa: BLE001 — doctor reports, never crashes
+            print(f"Cloud reachable:     ERROR ({e})")
+    else:
+        print("Cloud API:           NOT CONFIGURED")
+        print("                     (set KOVIO_API_URL and KOVIO_API_KEY to enable)")
 
     # Each adapter module imports cleanly (heavy deps are imported lazily inside
     # start()), so we probe the underlying runtime dependencies directly to
@@ -67,12 +89,17 @@ def cmd_demo(args) -> int:
     from .adapters.screen import BrowserScreenAdapter
     from .types import GateDecision
 
+    from .config import load_cloud_config
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     os.environ["KOVIO_PERCEPTION"] = "mock"
 
+    # Resolve the robot id once (CLI flag > KOVIO_ROBOT_ID > hostname) so the
+    # screen's engagement events and the agent's ad events share one id.
+    robot_id = args.robot_id or load_cloud_config().robot_id
     db_path = "kovio.db"
-    screen = BrowserScreenAdapter(db_path=db_path, robot_id=args.robot_id, port=DEMO_PORT)
-    agent = KovioAgent.autodetect(robot_id=args.robot_id, screen=screen, db_path=db_path)
+    screen = BrowserScreenAdapter(db_path=db_path, robot_id=robot_id, port=DEMO_PORT)
+    agent = KovioAgent.autodetect(robot_id=robot_id, screen=screen, db_path=db_path)
 
     @agent.task_gate
     def _attention_gate(task_state, scene) -> GateDecision:
@@ -131,7 +158,9 @@ def _run_agent(agent: KovioAgent) -> int:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="kovio")
-    parser.add_argument("--robot-id", default="tank-001")
+    # Default None so KOVIO_ROBOT_ID / hostname (via load_cloud_config) can apply;
+    # an explicit flag still wins.
+    parser.add_argument("--robot-id", default=None)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", help="Print platform & adapter status")

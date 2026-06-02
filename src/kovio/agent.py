@@ -49,13 +49,22 @@ class KovioAgent:
         creative_url: str | None = None,
         db_path: str | Path = "kovio.db",
         api_key: str | None = None,
+        store: "CampaignStore | None" = None,  # noqa: F821 (forward ref)
+        sink: "CloudEventSink | None" = None,  # noqa: F821 (forward ref)
     ) -> None:
         self.robot_id = robot_id
         self.screen = screen or ScreenAdapter.logger()
         self.perception = perception or PerceptionAdapter.stub()
+        # A campaign store (local or cloud) becomes a RuleBasedSelector unless an
+        # explicit selector was supplied. With neither, we fall back to the fixed
+        # creative_url — the local default-creative path stays intact.
+        if selector is None and store is not None:
+            from .campaigns.selector import RuleBasedSelector
+            selector = RuleBasedSelector(store)
         self.selector = selector
         self.creative_url = creative_url or _default_creative_url()
         self.api_key = api_key
+        self._sink = sink
 
         self._task_state = TaskState.IDLE
         self._last_scene: SceneState | None = None
@@ -72,31 +81,77 @@ class KovioAgent:
     # ---------- construction ----------
 
     @classmethod
-    def autodetect(cls, robot_id: str, **kwargs) -> "KovioAgent":
-        """Construct an agent using platform-detected adapters.
+    def autodetect(cls, robot_id: str | None = None, **kwargs) -> "KovioAgent":
+        """Construct an agent using platform-detected adapters and env-based cloud config.
 
         Perception and screen adapters are chosen from the running platform
         (overridable via KOVIO_PERCEPTION / KOVIO_SCREEN env vars, or by
         passing explicit `perception=` / `screen=` kwargs).
+
+        When KOVIO_API_URL and KOVIO_API_KEY are both set, the agent is wired to
+        a CloudCampaignStore (real campaigns) and a CloudEventSink (event upload).
+        With them unset it falls back to the local default-creative path — no
+        cloud calls, identical to local-only behavior.
         """
         from .adapters.perception import make_perception_adapter
         from .adapters.screen import make_screen_adapter
+        from .config import load_cloud_config
+
+        config = load_cloud_config()
+        effective_robot_id = robot_id or config.robot_id
+        db_path = kwargs.get("db_path", "kovio.db")
+
+        # Build the cloud-backed store and sink ONLY if config is complete and the
+        # caller didn't pass their own. Construction is best-effort: a CloudCampaignStore
+        # that can't reach the cloud logs a warning and serves its local cache.
+        store = kwargs.pop("store", None)
+        sink = kwargs.pop("sink", None)
+
+        if config.is_configured and store is None:
+            from .cloud import CloudCampaignStore
+            store = CloudCampaignStore(
+                api_url=config.api_url,
+                api_key=config.api_key,
+                db_path=db_path,
+                ttl_seconds=config.campaign_ttl_seconds,
+            )
+
+        if config.is_configured and sink is None:
+            from .cloud import CloudEventSink
+            sink = CloudEventSink(
+                api_url=config.api_url,
+                api_key=config.api_key,
+                db_path=db_path,
+                robot_id=effective_robot_id,
+            )
 
         perception = kwargs.pop("perception", None) or make_perception_adapter()
         screen = kwargs.pop("screen", None) or make_screen_adapter()
-        return cls(robot_id=robot_id, perception=perception, screen=screen, **kwargs)
+        return cls(
+            robot_id=effective_robot_id,
+            perception=perception,
+            screen=screen,
+            store=store,
+            sink=sink,
+            **kwargs,
+        )
 
     # ---------- public API ----------
 
     def start(self) -> None:
+        from . import __version__  # lazy: avoids a circular import at module load
         log.info("starting agent (robot_id=%s, selector=%s)",
                  self.robot_id, type(self.selector).__name__ if self.selector else "none")
-        self._emit("agent_started", {"version": "0.0.3"})
+        self._emit("agent_started", {"version": __version__})
+        if self._sink is not None:
+            self._sink.start()
         self.perception.start(self._handle_scene)
 
     def stop(self) -> None:
         log.info("stopping agent")
         self.perception.stop()
+        if self._sink is not None:
+            self._sink.stop()
         self.screen.clear()
         self._emit("agent_stopped", {})
 

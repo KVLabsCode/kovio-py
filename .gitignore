@@ -12,6 +12,11 @@ build/
 .kovio/
 kovio.db*
 
+# Cloud credentials — never commit
+.env
+.env.*
+!.env.example
+
 # Logs
 *.log
 
