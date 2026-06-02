@@ -32,6 +32,11 @@ kovio doctor          # confirms platform detection + adapter availability
 kovio demo            # runs with synthetic scenes — no camera needed
 ```
 
+`kovio demo` serves the robot screen at **http://localhost:8001** — open it in
+your browser. It breathes a "kovio" wordmark while idle, then plays the default
+creative (with a save-QR) when the mock perception reports someone attending.
+Tap the creative to record an engagement in `kovio.db`.
+
 ### Raspberry Pi 5 + Orbbec Astra
 
 ```bash

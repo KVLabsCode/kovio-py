@@ -37,6 +37,9 @@ dev = [
   "build",
   "twine",
   "ruff",
+  # `kovio demo` renders a scannable save-QR on the browser screen. Pure-Python
+  # (the SVG factory needs no Pillow); the demo degrades to a placeholder without it.
+  "qrcode>=7.4",
 ]
 
 # Raspberry Pi 5 + Orbbec Astra (OpenNI 2 backend)

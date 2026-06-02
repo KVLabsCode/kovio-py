@@ -61,3 +61,26 @@ from the prompt followed unless noted below.
 - The two example scripts under `examples/` still probe PATH for Chromium
   directly; they guard construction with `HAVE_CHROMIUM` so they remain correct,
   but were left untouched to keep this change adapter-focused.
+
+# Browser demo screen (post-0.0.6)
+
+Decisions made adding the browser-viewable `kovio demo` screen.
+
+- **`BrowserScreenAdapter` uses stdlib `http.server`, not FastAPI.** Screen
+  adapters live in the zero-dep core, so the demo server can't take the
+  dashboard's FastAPI/uvicorn dependency. A small `ThreadingTCPServer` keeps the
+  adapter installable everywhere. (The QR is the one optional dep — `qrcode`, in
+  `[dev]` — and degrades to a placeholder when absent.)
+- **`kovio demo` registers an attention gate.** Without a selector the agent
+  plays continuously whenever the task state is IDLE, so the screen would never
+  idle. A `task_gate` that allows only when `scene.attended_count > 0` produces
+  the intended idle → creative → idle storyline as the mock script cycles.
+- **The adapter writes engagements straight to the events table.** Rather than
+  threading a callback back into the agent, the adapter appends an `engagement`
+  `AdEvent` to the same `kovio.db` (creating the table if needed). This keeps the
+  cloud sink's drain path unchanged — engagements upload like any other event.
+- **`make_screen_adapter()` does NOT construct the browser adapter.** That
+  name-based factory has no DB/robot-id context, and the demo screen needs both.
+  `kovio demo` builds it explicitly and passes `screen=` to `autodetect()`.
+- **Local `file://` creatives are proxied via `/creative`** so the page can frame
+  them same-origin; `http(s)` creatives are framed directly.
