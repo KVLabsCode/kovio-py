@@ -1,0 +1,19 @@
+# Virtualenv
+.venv/
+
+# Python
+__pycache__/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Local data / DB
+.kovio/
+kovio.db*
+
+# Logs
+*.log
+
+# OS
+.DS_Store

@@ -1,0 +1,37 @@
+[
+  {
+    "campaign_id": "cafe_morning",
+    "name": "Cafe Astra — free pastry",
+    "advertiser": "Cafe Astra",
+    "creative_path": "creatives/coffee.html",
+    "targeting": [
+      { "field": "hour_of_day",  "op": "between", "value": [6, 11] },
+      { "field": "person_count", "op": "gte",     "value": 1 }
+    ],
+    "priority": 10,
+    "encounter_cap_seconds": 60
+  },
+  {
+    "campaign_id": "trattoria_evening",
+    "name": "Trattoria Bot — dinner for two",
+    "advertiser": "Trattoria Bot",
+    "creative_path": "creatives/dinner.html",
+    "targeting": [
+      { "field": "hour_of_day",  "op": "between", "value": [17, 21] },
+      { "field": "person_count", "op": "gte",     "value": 1 }
+    ],
+    "priority": 10,
+    "encounter_cap_seconds": 60
+  },
+  {
+    "campaign_id": "kovio_brand",
+    "name": "Kovio — brand awareness",
+    "advertiser": "Kovio",
+    "creative_path": "creatives/brand.html",
+    "targeting": [
+      { "field": "person_count", "op": "gte", "value": 1 }
+    ],
+    "priority": 1,
+    "encounter_cap_seconds": 30
+  }
+]

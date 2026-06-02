@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Robotads — live dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #0B1020;
+    --panel: #141A30;
+    --panel-2: #1B2240;
+    --border: #2A3258;
+    --text: #E8ECF7;
+    --muted: #8C96B8;
+    --accent: #6E7BFF;
+    --good: #4ADE80;
+    --warn: #FBBF24;
+    --bad: #F87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  body { padding: 24px; min-height: 100vh; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+  header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+  header .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--good); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.4; transform: scale(1.4); } }
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(4, 1fr); margin-bottom: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 8px; }
+  .card .value { font-size: 32px; font-weight: 600; letter-spacing: -0.02em; }
+  .card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .row { display: grid; gap: 16px; grid-template-columns: 1.4fr 1fr; margin-bottom: 24px; }
+  @media (max-width: 900px) { .row { grid-template-columns: 1fr; } .grid { grid-template-columns: repeat(2, 1fr); } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+  .panel h2 { font-size: 14px; font-weight: 600; margin-bottom: 14px; color: var(--text); }
+  .events { max-height: 320px; overflow-y: auto; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  .events table { width: 100%; border-collapse: collapse; }
+  .events td { padding: 6px 8px; border-bottom: 1px solid var(--border); color: var(--muted); }
+  .events td:first-child { color: var(--text); width: 90px; }
+  .events td:nth-child(2) { color: var(--accent); width: 140px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .badge.idle { background: #1A3A2A; color: var(--good); }
+  .badge.busy { background: #3A2D1A; color: var(--warn); }
+  .badge.hard { background: #3A1A1A; color: var(--bad); }
+  .chart-wrap { position: relative; height: 240px; }
+  footer { color: var(--muted); font-size: 11px; margin-top: 24px; text-align: right; }
+  .empty { color: var(--muted); font-style: italic; padding: 8px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="pulse"></div>
+  <h1>Robotads — live dashboard</h1>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">People in view</div>
+    <div class="value" id="m-people">—</div>
+    <div class="sub" id="m-people-sub">no scene yet</div>
+  </div>
+  <div class="card">
+    <div class="label">Mean distance</div>
+    <div class="value" id="m-dist">—</div>
+    <div class="sub">m from the screen</div>
+  </div>
+  <div class="card">
+    <div class="label">Now playing</div>
+    <div class="value" id="m-creative" style="font-size:18px">—</div>
+    <div class="sub" id="m-creative-sub"></div>
+  </div>
+  <div class="card">
+    <div class="label">Task state</div>
+    <div class="value" id="m-task" style="font-size:18px">—</div>
+    <div class="sub" id="m-task-sub"></div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2>Impressions by campaign — last 24h</h2>
+    <div class="chart-wrap"><canvas id="chart-impr"></canvas></div>
+    <div class="sub" style="color:var(--muted);font-size:12px;margin-top:10px">
+      Total people observed (sum of scene counts): <span id="m-people-total">0</span>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Active campaigns</h2>
+    <div id="campaign-list"></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Recent events</h2>
+  <div class="events">
+    <table id="events-table"><tbody></tbody></table>
+  </div>
+</div>
+
+<footer>auto-refreshing · last update <span id="last-update">—</span></footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtTime = (ts) => new Date(ts * 1000).toLocaleTimeString();
+
+let chart = null;
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
+}
+
+function badgeFor(taskValue, reason) {
+  if (!taskValue) return '<span class="badge idle">idle</span>';
+  if (taskValue.startsWith('hard_rule')) return '<span class="badge hard">' + taskValue + '</span>';
+  if (taskValue === 'idle') return '<span class="badge idle">idle</span>';
+  return '<span class="badge busy">' + taskValue + '</span>';
+}
+
+async function refreshState() {
+  try {
+    const s = await getJSON('/api/state');
+    if (s.last_scene) {
+      const p = JSON.parse(s.last_scene.payload_json);
+      $('m-people').textContent = p.person_count ?? '—';
+      $('m-people-sub').textContent = p.attended_count
+        ? `${p.attended_count} oriented toward screen`
+        : 'updated ' + fmtTime(s.last_scene.timestamp);
+      $('m-dist').textContent = p.mean_distance_m
+        ? p.mean_distance_m.toFixed(1)
+        : '—';
+    }
+    if (s.last_ad) {
+      const p = JSON.parse(s.last_ad.payload_json);
+      if (s.last_ad.event_type === 'ad_played') {
+        $('m-creative').textContent = p.campaign_id || 'fixed creative';
+        $('m-creative-sub').textContent = p.advertiser
+          ? p.advertiser
+          : 'played at ' + fmtTime(s.last_ad.timestamp);
+        $('m-task').innerHTML = badgeFor('idle', '');
+        $('m-task-sub').textContent = 'ad allowed';
+      } else {
+        $('m-creative').textContent = '—';
+        $('m-creative-sub').textContent = 'suppressed: ' + (p.reason || '?');
+        $('m-task').innerHTML = badgeFor(p.reason, p.reason);
+        $('m-task-sub').textContent = 'ads paused';
+      }
+    }
+    const cl = $('campaign-list');
+    if (s.campaigns.length === 0) {
+      cl.innerHTML = '<div class="empty">No campaigns loaded. Edit campaigns.json and restart the agent.</div>';
+    } else {
+      cl.innerHTML = s.campaigns.map(c => `
+        <div style="padding:10px 0;border-bottom:1px solid var(--border)">
+          <div style="font-size:14px;font-weight:500">${c.name}</div>
+          <div style="font-size:12px;color:var(--muted);margin-top:2px">
+            ${c.advertiser || 'no advertiser'} · priority ${c.priority} · <code>${c.campaign_id}</code>
+          </div>
+        </div>
+      `).join('');
+    }
+    $('last-update').textContent = fmtTime(s.server_time);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function refreshToday() {
+  try {
+    const t = await getJSON('/api/today');
+    $('m-people-total').textContent = t.people_observed_total;
+    const labels = t.impressions_by_campaign.map(r => r.campaign_id || 'fixed');
+    const data = t.impressions_by_campaign.map(r => r.count);
+    if (!chart) {
+      const ctx = document.getElementById('chart-impr').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels, datasets: [{
+          data, backgroundColor: '#6E7BFF', borderRadius: 6,
+        }]},
+        options: {
+          plugins: { legend: { display: false }},
+          maintainAspectRatio: false,
+          scales: {
+            x: { ticks: { color: '#8C96B8' }, grid: { display: false }},
+            y: { ticks: { color: '#8C96B8' }, grid: { color: '#2A3258' }, beginAtZero: true },
+          },
+        },
+      });
+    } else {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = data;
+      chart.update('none');
+    }
+  } catch (e) { console.error(e); }
+}
+
+async function refreshEvents() {
+  try {
+    const ev = await getJSON('/api/events?limit=40');
+    const tbody = document.querySelector('#events-table tbody');
+    tbody.innerHTML = ev.map(e => `
+      <tr>
+        <td>${fmtTime(e.timestamp)}</td>
+        <td>${e.event_type}</td>
+        <td>${e.payload_json.length > 80 ? e.payload_json.slice(0,77)+'…' : e.payload_json}</td>
+      </tr>
+    `).join('');
+  } catch (e) { console.error(e); }
+}
+
+refreshState(); refreshToday(); refreshEvents();
+setInterval(refreshState, 2000);
+setInterval(refreshEvents, 3000);
+setInterval(refreshToday, 15000);
+</script>
+
+</body>
+</html>
