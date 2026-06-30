@@ -199,14 +199,22 @@ class KovioAgent:
                     cb(scene)
                 except Exception:
                     log.exception("scene callback raised")
-            self._emit(
-                "scene_observed",
-                {
-                    "person_count": scene.person_count,
-                    "attended_count": scene.attended_count,
-                    "mean_distance_m": scene.mean_distance_m,
-                },
-            )
+            # Scalar snapshot (counts, attention, dwell, crowd) — the scene_observed
+            # event the cloud correlates with each impression. scalar_payload()
+            # omits None fields so a basic adapter still emits the original three.
+            self._emit("scene_observed", scene.scalar_payload())
+            # Discrete interactions travel as their own events so the cloud can
+            # count them into the engagement funnel without parsing scene blobs.
+            for ix in scene.interactions:
+                self._emit(
+                    "interaction_observed",
+                    {
+                        "kind": ix.kind,
+                        "confidence": ix.confidence,
+                        "track_id": ix.track_id,
+                        "distance_m": ix.distance_m,
+                    },
+                )
             self._reevaluate()
 
     def _reevaluate(self) -> None:

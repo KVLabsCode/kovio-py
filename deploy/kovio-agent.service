@@ -1,0 +1,28 @@
+[Unit]
+Description=Kovio robot ad agent (on-device perception + ad playout)
+Documentation=https://kovio.dev
+# Needs the network up so the lidar DDS (eth0) and cloud uploads work.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+# Secrets + config live here (KOVIO_API_KEY, KOVIO_PERCEPTION=rich, etc).
+EnvironmentFile=/etc/kovio/kovio.env
+ExecStart=/opt/kovio/venv/bin/kovio serve
+# Keep it up across crashes, camera hiccups, and reboots.
+Restart=always
+RestartSec=5
+# Device access: RealSense over USB (video/plugdev), nothing privileged.
+SupplementaryGroups=plugdev video
+# Local event buffer (kovio.db) survives restarts here.
+WorkingDirectory=/var/lib/kovio
+StateDirectory=kovio
+# Hardening — the agent needs no elevated capabilities.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

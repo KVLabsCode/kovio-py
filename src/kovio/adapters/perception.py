@@ -39,7 +39,8 @@ def make_perception_adapter(name: str | None = None) -> "PerceptionAdapter":
     """Construct the perception adapter by name.
 
     If name is None, falls back to KOVIO_PERCEPTION env var, then to
-    the platform default. Recognized names: 'mock', 'orbbec', 'realsense'.
+    the platform default. Recognized names: 'mock', 'orbbec', 'realsense',
+    'rich' (depth-camera + lidar fusion with interaction metrics).
     """
     from ..platform import (
         detect_platform,
@@ -59,9 +60,12 @@ def make_perception_adapter(name: str | None = None) -> "PerceptionAdapter":
     if name == "realsense":
         from .realsense_perception import RealSensePerceptionAdapter
         return RealSensePerceptionAdapter()
+    if name in ("rich", "realsense_rich", "fusion"):
+        from .rich_perception import RichPerceptionAdapter
+        return RichPerceptionAdapter()
     raise ValueError(
         f"Unknown perception adapter: {name!r}. "
-        f"Valid: mock, orbbec, realsense."
+        f"Valid: mock, orbbec, realsense, rich."
     )
 
 

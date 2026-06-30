@@ -123,6 +123,23 @@ class DecisionContext:
             return self.scene.attended_count
         if name == "mean_distance_m":
             return self.scene.mean_distance_m
+        # --- enriched perception fields (None on basic adapters) ---
+        if name == "people_nearby":
+            return self.scene.people_nearby
+        if name == "crowd_density":
+            return self.scene.crowd_density
+        if name == "nearest_distance_m":
+            return self.scene.nearest_distance_m
+        if name == "approach_bearing_deg":
+            return self.scene.approach_bearing_deg
+        if name == "looked_count":
+            return self.scene.looked_count
+        if name == "mean_dwell_s":
+            return self.scene.mean_dwell_s
+        if name == "interaction_count":
+            return len(self.scene.interactions)
+        if name == "interaction_kinds":
+            return [ix.kind for ix in self.scene.interactions]
         if name == "hour_of_day":
             return self.hour_of_day
         if name == "day_of_week":
