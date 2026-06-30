@@ -1,0 +1,28 @@
+[Unit]
+Description=Kovio rich-perception agent (RealSense + cloud)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+# Credentials + KOVIO_PERCEPTION=rich etc.
+EnvironmentFile=/etc/kovio/kovio.env
+# aarch64 fixes discovered during bringup: preload libgomp so cv2/onnxruntime
+# load, and raise the static-TLS surplus. HOME so the model cache resolves.
+Environment=LD_PRELOAD=/home/unitree/miniforge3/envs/kovio/lib/libgomp.so.1
+Environment=GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4000000
+Environment=HOME=/home/unitree
+# Livox lidar via Unitree DDS (cyclonedds needs to find libddsc at runtime).
+Environment=CYCLONEDDS_HOME=/home/unitree/miniforge3/envs/kovio
+Environment=LD_LIBRARY_PATH=/home/unitree/miniforge3/envs/kovio/lib
+ExecStart=/home/unitree/miniforge3/envs/kovio/bin/kovio serve
+Restart=always
+RestartSec=5
+# RealSense over USB.
+SupplementaryGroups=plugdev video
+# Writable: kovio.db (event buffer) + ~/.cache/kovio/models live here.
+WorkingDirectory=/home/unitree
+
+[Install]
+WantedBy=multi-user.target
