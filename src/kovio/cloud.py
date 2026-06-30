@@ -236,9 +236,30 @@ class CloudEventSink:
             # Table doesn't exist yet — will be created by the agent. Retry on first drain.
             pass
 
+    def _heartbeat(self) -> None:
+        """Register/refresh this robot in the cloud. The server auto-registers a
+        robot on its first heartbeat (keyed by the fleet API key + robot_id), so
+        a freshly-flashed robot needs no manual provisioning: boot the agent and
+        it appears in its fleet. Sent before each drain so the robot row exists
+        by the time its events arrive (otherwise they'd land unattributed)."""
+        if not self.robot_id:
+            return
+        status, payload = _post_json(
+            f"{self.api_url}/sdk/v1/heartbeat",
+            {"robot_id": self.robot_id, "status": "online"},
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+        )
+        if status == 200 and payload:
+            if payload.get("registered"):
+                log.info("cloud.robot.registered", extra={"robot_id": self.robot_id})
+        else:
+            log.warning("cloud.heartbeat.failed", extra={"status": status})
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                self._heartbeat()  # auto-register + liveness, before draining events
                 self._drain_once()
             except Exception:
                 log.exception("cloud.sink.drain_failed")
