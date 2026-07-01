@@ -63,3 +63,33 @@ def test_bearing_right_is_positive():
     pts2 = _blob(1.0, -1.0) + _blob(3.0, 2.0)
     r2 = analyze_pointcloud(pts2)
     assert r2.people_nearby == 2 and r2.approach_bearing_deg > 0
+
+
+def test_people_positions_emitted_nearest_first():
+    # Two bodies: one ahead-left far, one right near. people[] is nearest-first
+    # polar (range, bearing CW), so the near one (positive bearing) leads.
+    pts = _blob(3.0, 1.0) + _blob(1.0, -1.0)
+    r = analyze_pointcloud(pts)
+    assert r.people_nearby == 2
+    assert len(r.people) == 2
+    near_rng, near_bear = r.people[0]
+    assert abs(near_rng - math.hypot(1.0, 1.0)) < 0.2
+    assert near_bear > 0                      # body on the right -> +bearing
+    assert r.people[1][0] > r.people[0][0]    # sorted by range
+
+
+def test_empty_reading_has_no_people():
+    assert analyze_pointcloud([]).people == ()
+
+
+def test_count_new_entries_pure():
+    from kovio.adapters.lidar import count_new_entries
+
+    # nobody before, two now -> two entries
+    assert count_new_entries([], [(1.0, 0.0), (2.0, 1.0)]) == 2
+    # same two roughly where they were -> nobody new
+    assert count_new_entries([(1.0, 0.0), (2.0, 1.0)], [(1.05, 0.0), (2.0, 1.1)]) == 0
+    # one stayed, one left, one fresh arrival -> exactly one entry
+    assert count_new_entries([(1.0, 0.0), (5.0, 5.0)], [(1.0, 0.0), (0.0, -2.0)]) == 1
+    # a jump beyond the gate reads as a new body, not the same person moved
+    assert count_new_entries([(1.0, 0.0)], [(4.0, 0.0)], gate_m=0.8) == 1

@@ -39,6 +39,7 @@ class Track:
     distance_m: float | None = None
     looking: bool = False
     looking_seconds: float = 0.0
+    hits: int = 1               # frames this track has been matched (incl. spawn)
     _missed: int = 0
     _gaze_event_fired: bool = field(default=False, repr=False)
 
@@ -56,6 +57,12 @@ class CentroidTracker:
         max_missed: drop a track after this many consecutive frames unseen.
         gaze_dwell_seconds: looking_seconds threshold at which a track is
             reported (once) as having a sustained gaze.
+        min_hits: a track must be matched this many frames before it is
+            "confirmed" — real people persist across frames, single-frame
+            detector phantoms do not. ``confirmed_tracks()`` filters on this so
+            counts/dwell ignore flicker. Default 1 = confirm immediately.
+        max_dwell_seconds: hard ceiling on reported dwell, a safety net against a
+            static misdetection re-matching one track forever (the 600s bug).
     """
 
     def __init__(
@@ -63,10 +70,14 @@ class CentroidTracker:
         max_distance_px: float = 120.0,
         max_missed: int = 5,
         gaze_dwell_seconds: float = 1.5,
+        min_hits: int = 1,
+        max_dwell_seconds: float = 600.0,
     ) -> None:
         self.max_distance_px = max_distance_px
         self.max_missed = max_missed
         self.gaze_dwell_seconds = gaze_dwell_seconds
+        self.min_hits = min_hits
+        self.max_dwell_seconds = max_dwell_seconds
         self._tracks: dict[int, Track] = {}
         self._ids = itertools.count(1)
         self._last_now: float | None = None
@@ -102,6 +113,7 @@ class CentroidTracker:
             tr.looking = det.looking
             tr.last_seen = now
             tr._missed = 0
+            tr.hits += 1
             if det.looking:
                 tr.looking_seconds += dt
             matched_tracks.add(tid)
@@ -131,12 +143,30 @@ class CentroidTracker:
 
         return [t for t in self._tracks.values() if t._missed == 0]
 
+    def confirmed_tracks(self) -> list[Track]:
+        """Live tracks seen for at least ``min_hits`` frames — the real people.
+
+        Filters out flickering detector phantoms (a mislabelled chair/lamp that
+        only crosses the confidence gate now and then) so counts and dwell
+        reflect people, not noise.
+        """
+        return [
+            t
+            for t in self._tracks.values()
+            if t._missed == 0 and t.hits >= self.min_hits
+        ]
+
     def mean_dwell_seconds(self) -> float | None:
-        """Mean dwell across currently-live tracks (None if no one is tracked)."""
-        live = [t for t in self._tracks.values() if t._missed == 0]
+        """Mean dwell across confirmed live tracks (None if nobody is tracked).
+
+        Dwell is clamped to ``max_dwell_seconds`` so a stuck track can never
+        report a physically implausible dwell.
+        """
+        live = self.confirmed_tracks()
         if not live:
             return None
-        return sum(t.dwell_seconds for t in live) / len(live)
+        capped = [min(t.dwell_seconds, self.max_dwell_seconds) for t in live]
+        return sum(capped) / len(capped)
 
     def new_gaze_dwell_tracks(self) -> list[Track]:
         """Tracks that *just* crossed the sustained-gaze threshold (fires once).

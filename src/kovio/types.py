@@ -76,6 +76,10 @@ class SceneState:
     crowd_density: float | None = None       # people per m^2 in the radius
     nearest_distance_m: float | None = None  # closest body (lidar; sub-camera-FOV)
     approach_bearing_deg: float | None = None  # bearing of nearest body, 0=front, +right
+    # per-person polar blips (range_m, bearing_deg) for the live radar
+    lidar_people: tuple[tuple[float, float], ...] | None = None
+    # unique bodies that ENTERED the lidar field this tick (cumulative "passed by")
+    lidar_passed: int | None = None
 
     # --- depth/RGB: attention & dwell (None when not computed) ---
     looked_count: int | None = None          # people whose gaze is on the screen this tick
@@ -102,6 +106,13 @@ class SceneState:
             "approach_bearing_deg": self.approach_bearing_deg,
             "looked_count": self.looked_count,
             "mean_dwell_s": self.mean_dwell_s,
+            # JSON-ready blips: [[range_m, bearing_deg], ...] for the live radar
+            "lidar_people": (
+                [[r, b] for r, b in self.lidar_people]
+                if self.lidar_people is not None
+                else None
+            ),
+            "lidar_passed": self.lidar_passed,
         }
         return {k: v for k, v in fields.items() if v is not None}
 

@@ -203,7 +203,7 @@ def associate_phones(persons: list[Box], phones: list[Box]) -> tuple[int, set[in
 class YoloDetector:
     """YOLOv8 detection wrapper restricted to a set of COCO classes."""
 
-    def __init__(self, model: str = "yolov8n", conf: float = 0.4, classes=None):
+    def __init__(self, model: str = "yolov8n", conf: float = 0.5, classes=None):
         import onnxruntime as ort  # noqa: lazy
 
         self.conf = conf
@@ -275,7 +275,7 @@ class GazeEstimator:
 class PoseDetector:
     """YOLOv8-pose wrapper -> per-person COCO-17 keypoints."""
 
-    def __init__(self, model: str = "yolov8n-pose", conf: float = 0.4):
+    def __init__(self, model: str = "yolov8n-pose", conf: float = 0.5):
         import onnxruntime as ort  # noqa: lazy
 
         self.conf = conf

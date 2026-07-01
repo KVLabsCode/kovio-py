@@ -30,6 +30,9 @@ class CrowdReading:
     crowd_density: float          # people per m^2 within the radius
     nearest_distance_m: float | None
     approach_bearing_deg: float | None
+    # Per-person polar positions for the live radar: (range_m, bearing_deg),
+    # bearing 0=front, +=right (clockwise), nearest first. Empty when no bodies.
+    people: tuple[tuple[float, float], ...] = ()
 
 
 def _dbscan_2d(points, eps, min_points):
@@ -105,30 +108,85 @@ def analyze_pointcloud(
         return CrowdReading(0, round(density, 4), None, None)
 
     people.sort(key=lambda t: t[0])
+    # Polar position of every body (nearest first) for the radar; +y is left so
+    # negate to get clockwise bearing (0=front, +90=right).
+    positions = tuple(
+        (round(rng, 2), round(math.degrees(math.atan2(-cy, cx)), 1))
+        for rng, cx, cy in people
+    )
     rng, nx, ny = people[0]
     bearing = math.degrees(math.atan2(-ny, nx))  # +y is left -> negate for CW
-    return CrowdReading(count, round(density, 4), round(rng, 2), round(bearing, 1))
+    return CrowdReading(
+        count, round(density, 4), round(rng, 2), round(bearing, 1), positions
+    )
+
+
+def _polar_to_xy(positions) -> list[tuple[float, float]]:
+    """(range_m, bearing_deg CW from front) -> body-frame (x fwd, y left)."""
+    out = []
+    for rng, bearing in positions:
+        a = math.radians(bearing)
+        out.append((rng * math.cos(a), -rng * math.sin(a)))  # bearing is CW
+    return out
+
+
+def count_new_entries(prev_xy, curr_xy, gate_m: float = 0.8) -> int:
+    """How many ``curr_xy`` bodies are NEW vs ``prev_xy`` (greedy nearest match).
+
+    A body that matches a previous one within ``gate_m`` is the same person who
+    was already in the field; an unmatched body just entered. Pure so the
+    "people passed by" count can be unit-tested without a lidar. This is the
+    lidar analogue of the tracker's unique-reach fix: each person is counted
+    once on entry, never once per frame.
+    """
+    used: set[int] = set()
+    new = 0
+    for cx, cy in curr_xy:
+        best, best_d = None, gate_m
+        for j, (px, py) in enumerate(prev_xy):
+            if j in used:
+                continue
+            d = math.hypot(cx - px, cy - py)
+            if d <= best_d:
+                best, best_d = j, d
+        if best is None:
+            new += 1
+        else:
+            used.add(best)
+    return new
 
 
 class LidarSource:
-    """Pulls pointclouds off the Go2 and exposes the latest crowd reading.
+    """Pulls pointclouds off the robot and exposes the latest crowd reading.
 
-    Backends, tried in order: the Unitree DDS ``rt/utlidar/cloud`` topic (via
-    the ``unitree_sdk2py`` bindings) and a Livox stream. Construction never
-    raises on a host without a lidar — ``available`` reports False and
-    ``read()`` returns None so the fused adapter simply omits lidar metrics.
+    Backends, tried in order: the Unitree DDS pointcloud topic (via the
+    ``unitree_sdk2py`` bindings) and a Livox stream. Construction never raises
+    on a host without a lidar — ``available`` reports False and ``read()``
+    returns None so the fused adapter simply omits lidar metrics.
+
+    The default topic is the Livox MID-360 cloud the Unitree firmware publishes
+    (``rt/utlidar/cloud_livox_mid360``); the legacy Go2 ``rt/utlidar/cloud`` can
+    be selected explicitly. Override with the ``KOVIO_LIDAR_TOPIC`` env var.
     """
 
     def __init__(
         self,
         radius_m: float = 4.0,
         network_interface: str = "eth0",
-        topic: str = "rt/utlidar/cloud",
+        topic: str = "rt/utlidar/cloud_livox_mid360",
+        entry_gate_m: float = 0.8,
     ) -> None:
+        import os
+
         self.radius_m = radius_m
+        self._entry_gate_m = entry_gate_m
         self._latest: CrowdReading | None = None
+        # unique "people passed by" accounting (frame-to-frame body matching).
+        self._prev_xy: list[tuple[float, float]] = []
+        self._passed_accum = 0
         self._sub = None
         self._backend = None
+        topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
         try:
             self._init_unitree_dds(network_interface, topic)
             self._backend = "unitree_dds"
@@ -153,7 +211,13 @@ class LidarSource:
     def _on_cloud(self, msg) -> None:
         try:
             pts = self._decode_pointcloud2(msg)
-            self._latest = analyze_pointcloud(pts, radius_m=self.radius_m)
+            reading = analyze_pointcloud(pts, radius_m=self.radius_m)
+            curr_xy = _polar_to_xy(reading.people)
+            self._passed_accum += count_new_entries(
+                self._prev_xy, curr_xy, self._entry_gate_m
+            )
+            self._prev_xy = curr_xy
+            self._latest = reading
         except Exception:
             log.exception("lidar: failed to process cloud")
 
@@ -173,3 +237,9 @@ class LidarSource:
     def read(self) -> CrowdReading | None:
         """Most recent crowd reading, or None if no lidar is attached."""
         return self._latest
+
+    def take_passed(self) -> int:
+        """Unique bodies that ENTERED the lidar field since the last call, then
+        reset. Summed in the cloud into a cumulative "people passed by" count."""
+        n, self._passed_accum = self._passed_accum, 0
+        return n

@@ -79,7 +79,11 @@ class RichPerceptionAdapter(PerceptionAdapter):
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._tracker = CentroidTracker(gaze_dwell_seconds=gaze_dwell_seconds)
+        # min_hits=2: a detection must persist across two ticks to count as a
+        # person, filtering single-tick detector flicker on background clutter.
+        self._tracker = CentroidTracker(
+            gaze_dwell_seconds=gaze_dwell_seconds, min_hits=2
+        )
         self._gestures = GestureClassifier()
         self._last_fired: dict[tuple[int, str], float] = {}
         self._phone_state: dict[int, bool] = {}
@@ -160,9 +164,31 @@ class RichPerceptionAdapter(PerceptionAdapter):
         log.info("rich perception started (cadence=%.2fs)", self._cadence)
 
         last_emit = 0.0
+        misses = 0
         try:
             while not self._stop.is_set():
-                frames = pipeline.wait_for_frames(timeout_ms=1000)
+                # A transient frame timeout must NOT kill perception. Count
+                # consecutive misses; after a run of them, rebuild the pipeline
+                # (recovers a hung/dropped RealSense) instead of dying.
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=2000)
+                    misses = 0
+                except RuntimeError as e:
+                    misses += 1
+                    log.warning("frame wait failed (%d in a row): %s", misses, e)
+                    if misses >= 5:
+                        log.error("no frames after %d tries; restarting pipeline", misses)
+                        try:
+                            pipeline.stop()
+                        except Exception:
+                            pass
+                        try:
+                            pipeline.start(config)
+                            misses = 0
+                        except Exception:
+                            log.exception("pipeline restart failed; retrying")
+                            time.sleep(2.0)
+                    continue
                 aligned = align.process(frames)
                 color = aligned.get_color_frame()
                 depth = aligned.get_depth_frame()
@@ -233,10 +259,14 @@ class RichPerceptionAdapter(PerceptionAdapter):
                 Detection(cx=box.cx, cy=box.cy, distance_m=dist, looking=looking)
             )
 
-        # 4) Track -> stable ids, dwell, sustained-gaze events.
+        # 4) Track -> stable ids, dwell, sustained-gaze events. Counts come from
+        # CONFIRMED tracks (seen >= min_hits frames), so a chair/lamp that only
+        # trips the detector now and then never becomes a "person".
         tracks = self._tracker.update(detections, now)
+        confirmed = self._tracker.confirmed_tracks()
+        confirmed_ids = {t.track_id for t in confirmed}
         mean_dwell = self._tracker.mean_dwell_seconds()
-        looked_count = sum(1 for t in tracks if t.looking)
+        looked_count = sum(1 for t in confirmed if t.looking)
 
         # Map each detection index to its track id by nearest centroid.
         track_for_idx = self._match_tracks_to_people(person_boxes, tracks)
@@ -247,7 +277,7 @@ class RichPerceptionAdapter(PerceptionAdapter):
         if pose is not None and self._enable_gestures:
             for idx, (box, kp) in enumerate(people):
                 tid = track_for_idx.get(idx)
-                if tid is None or kp is None:
+                if tid is None or kp is None or tid not in confirmed_ids:
                     continue
                 fl, fr = self._forward_hints(depth, kp, self._depth_at(depth, box.cx, box.cy))
                 for hit in self._gestures.classify(tid, kp, now, fl, fr):
@@ -262,19 +292,22 @@ class RichPerceptionAdapter(PerceptionAdapter):
             live_ids = {t.track_id for t in tracks}
             holder_ids = {track_for_idx.get(i) for i in holders}
             holder_ids.discard(None)
+            holder_ids &= confirmed_ids  # ignore phantom "phone holders"
             for tid in holder_ids:
                 if not self._phone_state.get(tid, False) and self._allow(tid, InteractionKind.PHONE_OUT, now):
                     interactions.append(Interaction(InteractionKind.PHONE_OUT, 0.9, tid))
             self._phone_state = {tid: (tid in holder_ids) for tid in live_ids}
 
-        # 7) Sustained-gaze events.
+        # 7) Sustained-gaze events (confirmed people only).
         for t in self._tracker.new_gaze_dwell_tracks():
-            interactions.append(
-                Interaction(InteractionKind.GAZE_DWELL, 1.0, t.track_id, t.distance_m)
-            )
+            if t.track_id in confirmed_ids:
+                interactions.append(
+                    Interaction(InteractionKind.GAZE_DWELL, 1.0, t.track_id, t.distance_m)
+                )
 
-        # 8) Lidar crowd context.
+        # 8) Lidar crowd context (+ per-person blips and unique-entry "passed").
         people_nearby = crowd_density = nearest = bearing = None
+        lidar_people = lidar_passed = None
         if lidar is not None:
             reading = lidar.read()
             if reading is not None:
@@ -282,16 +315,28 @@ class RichPerceptionAdapter(PerceptionAdapter):
                 crowd_density = reading.crowd_density
                 nearest = reading.nearest_distance_m
                 bearing = reading.approach_bearing_deg
+                lidar_people = reading.people
+                # take_passed drains the entries accumulated since the last tick,
+                # so summing lidar_passed in the cloud yields unique bodies seen.
+                lidar_passed = lidar.take_passed()
 
-        mean_d = sum(distances) / len(distances) if distances else None
+        # Emit confirmed-people metrics: a flickering false positive never
+        # reaches min_hits, so it contributes to none of these.
+        conf_dists = [t.distance_m for t in confirmed if t.distance_m is not None]
+        mean_d = sum(conf_dists) / len(conf_dists) if conf_dists else None
+        attended_confirmed = sum(
+            1 for t in confirmed if t.distance_m is not None and t.distance_m <= self._attn
+        )
         return SceneState(
-            person_count=len(person_boxes),
-            attended_count=attended,
+            person_count=len(confirmed),
+            attended_count=attended_confirmed,
             mean_distance_m=mean_d,
             people_nearby=people_nearby,
             crowd_density=crowd_density,
             nearest_distance_m=nearest,
             approach_bearing_deg=bearing,
+            lidar_people=lidar_people,
+            lidar_passed=lidar_passed,
             looked_count=looked_count,
             mean_dwell_s=round(mean_dwell, 2) if mean_dwell is not None else None,
             interactions=tuple(interactions),
