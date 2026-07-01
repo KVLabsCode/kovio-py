@@ -186,9 +186,11 @@ class LidarSource:
         self._passed_accum = 0
         self._sub = None
         self._backend = None
-        topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
+        # Resolved topic is kept so diagnostics (`kovio doctor`) can report which
+        # DDS topic this source is (or would be) listening on.
+        self._topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
         try:
-            self._init_unitree_dds(network_interface, topic)
+            self._init_unitree_dds(network_interface, self._topic)
             self._backend = "unitree_dds"
         except Exception as e:  # noqa: BLE001 - any failure means "no lidar here"
             log.info("lidar: unitree DDS backend unavailable (%s)", e)
@@ -196,6 +198,17 @@ class LidarSource:
     @property
     def available(self) -> bool:
         return self._backend is not None
+
+    @property
+    def backend(self) -> str | None:
+        """The active backend name (e.g. ``"unitree_dds"``), or None when no
+        lidar could be attached on this host."""
+        return self._backend
+
+    @property
+    def topic(self) -> str:
+        """The DDS pointcloud topic this source subscribes to."""
+        return self._topic
 
     def _init_unitree_dds(self, iface: str, topic: str) -> None:
         from unitree_sdk2py.core.channel import (  # type: ignore

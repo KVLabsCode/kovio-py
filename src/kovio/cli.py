@@ -60,7 +60,45 @@ def cmd_doctor(args) -> int:
                   f"missing {', '.join(missing)})")
         else:
             print(f"{name:20s} OK")
+
+    _probe_lidar()
     return 0
+
+
+def _probe_lidar() -> None:
+    """Instantiate the LiDAR source and report backend, topic, and whether a
+    frame arrives — a dead lidar silently drops the OEM live-panel radar to
+    "awaiting lidar…", so surfacing it here catches it BEFORE a live demo.
+
+    Construction never raises on a host without a lidar (LidarSource swallows the
+    backend-init failure), so this is always safe to run.
+    """
+    from .adapters.lidar import LidarSource
+
+    lidar = LidarSource()
+    print(f"LiDAR backend:       {lidar.backend or '(none — no lidar on this host)'}")
+    print(f"LiDAR topic:         {lidar.topic}")
+
+    # read() is fed asynchronously by the DDS cloud callback, so poll briefly to
+    # give a live backend a chance to deliver its first frame before reporting.
+    frame = None
+    if lidar.available:
+        for _ in range(20):
+            frame = lidar.read()
+            if frame is not None:
+                break
+            time.sleep(0.1)
+
+    if frame is not None:
+        nearest = frame.nearest_distance_m
+        print(
+            f"LiDAR read():        frame OK "
+            f"({frame.people_nearby} nearby, nearest={nearest} m)"
+        )
+    elif lidar.available:
+        print("LiDAR read():        no frame yet (backend up, but no cloud received)")
+    else:
+        print("LiDAR read():        no frame (no lidar backend on this host)")
 
 
 def _extra_hint(adapter_name: str) -> str:

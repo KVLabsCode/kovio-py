@@ -93,3 +93,17 @@ def test_count_new_entries_pure():
     assert count_new_entries([(1.0, 0.0), (5.0, 5.0)], [(1.0, 0.0), (0.0, -2.0)]) == 1
     # a jump beyond the gate reads as a new body, not the same person moved
     assert count_new_entries([(1.0, 0.0)], [(4.0, 0.0)], gate_m=0.8) == 1
+
+
+def test_lidar_source_reports_backend_and_topic(monkeypatch):
+    """`kovio doctor` reads these to flag a dead lidar before a live demo:
+    construction never raises on a host without a lidar, `available`/`backend`
+    reflect that, `topic` honours the env override, and `read()` starts empty."""
+    from kovio.adapters.lidar import LidarSource
+
+    monkeypatch.setenv("KOVIO_LIDAR_TOPIC", "rt/utlidar/cloud")
+    src = LidarSource(network_interface="does-not-exist0")
+
+    assert src.topic == "rt/utlidar/cloud"          # env override wins
+    assert src.available == (src.backend is not None)
+    assert src.read() is None                        # no cloud yet -> no frame
