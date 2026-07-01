@@ -193,7 +193,7 @@ class LidarSource:
         network_interface: str = "eth0",
         topic: str = "rt/utlidar/cloud_livox_mid360",
         entry_gate_m: float = 0.8,
-        ros2_topic: str = "rt/livox/lidar",
+        ros2_topic: str = "rt/livox/lidar,rt/utlidar/cloud_livox_mid360",
         retry_seconds: float = 5.0,
     ) -> None:
         self.radius_m = radius_m
@@ -210,11 +210,18 @@ class LidarSource:
 
         self._iface = os.environ.get("KOVIO_LIDAR_NET_IFACE", network_interface)
         self._dds_topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
-        self._ros2_topic = os.environ.get("KOVIO_LIDAR_ROS2_TOPIC", ros2_topic)
+        # The cyclonedds reader tries several candidate topics (best-effort matches
+        # both the livox_ros_driver2 output AND the firmware's native cloud, which
+        # unitree_sdk2py's own subscriber fails to type-match).
+        self._ros2_topics = [
+            t.strip()
+            for t in os.environ.get("KOVIO_LIDAR_ROS2_TOPIC", ros2_topic).split(",")
+            if t.strip()
+        ]
         self._backend_pref = os.environ.get("KOVIO_LIDAR_BACKEND", "auto").lower()
 
         self._dds_sub = None
-        self._ros2_reader = None
+        self._ros2_readers: list = []
         self._started = {"unitree_dds": False, "ros2_livox": False}
         # The Unitree SDK owns the process-wide cyclonedds domain (and binds it to
         # the robot NIC); when present we bring it up FIRST and let both readers
@@ -242,13 +249,14 @@ class LidarSource:
     def topic(self) -> str:
         """The topic this source is receiving on (or listening on if not yet
         locked). Reported by ``kovio doctor``."""
+        ros2 = ", ".join(self._ros2_topics)
         if self._active_backend == "ros2_livox":
-            return self._ros2_topic
+            return ros2
         if self._active_backend == "unitree_dds":
             return self._dds_topic
         listening = []
         if self._started.get("ros2_livox"):
-            listening.append(self._ros2_topic)
+            listening.append(ros2)
         if self._started.get("unitree_dds"):
             listening.append(self._dds_topic)
         return ", ".join(listening) or self._dds_topic
@@ -327,7 +335,10 @@ class LidarSource:
             try:
                 self._start_ros2_livox()
                 self._started["ros2_livox"] = True
-                log.info("lidar: ros2_livox backend listening on %s", self._ros2_topic)
+                log.info(
+                    "lidar: ros2_livox backend listening on %s",
+                    ", ".join(self._ros2_topics),
+                )
             except Exception as e:  # noqa: BLE001 - no ros2/cyclonedds here is fine
                 log.info("lidar: ros2_livox backend unavailable (%s)", e)
 
@@ -359,24 +370,28 @@ class LidarSource:
             Policy.Durability.Volatile,
         )
         participant = DomainParticipant(0)
-        topic = Topic(participant, self._ros2_topic, PointCloud2_, qos=qos)
-        self._ros2_reader = DataReader(participant, topic, qos=qos)
-        # Hold refs so they aren't GC'd out from under the reader.
+        # Hold refs so they aren't GC'd out from under the readers.
         self._ros2_participant = participant
-        self._ros2_topic_obj = topic
+        self._ros2_topic_objs = []
+        self._ros2_readers = []
+        for name in self._ros2_topics:
+            topic = Topic(participant, name, PointCloud2_, qos=qos)
+            self._ros2_topic_objs.append(topic)
+            self._ros2_readers.append(DataReader(participant, topic, qos=qos))
         threading.Thread(
             target=self._ros2_poll_loop, name="kovio-lidar-ros2", daemon=True
         ).start()
 
     def _ros2_poll_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                samples = self._ros2_reader.take(N=8)
-            except Exception:
-                samples = []
-            for s in samples or []:
-                msg = getattr(s, "data", s)  # cyclonedds may wrap in a sample
-                self._ingest("ros2_livox", msg)
+            for reader in self._ros2_readers:
+                try:
+                    samples = reader.take(N=8)
+                except Exception:
+                    samples = []
+                for s in samples or []:
+                    msg = getattr(s, "data", s)  # cyclonedds may wrap in a sample
+                    self._ingest("ros2_livox", msg)
             time.sleep(0.05)
 
     # ---- shared ingest -------------------------------------------------- #
