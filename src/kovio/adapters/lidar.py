@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import struct
+import threading
+import time
 from dataclasses import dataclass
 
 log = logging.getLogger("kovio.perception.lidar")
@@ -159,14 +163,28 @@ def count_new_entries(prev_xy, curr_xy, gate_m: float = 0.8) -> int:
 class LidarSource:
     """Pulls pointclouds off the robot and exposes the latest crowd reading.
 
-    Backends, tried in order: the Unitree DDS pointcloud topic (via the
-    ``unitree_sdk2py`` bindings) and a Livox stream. Construction never raises
-    on a host without a lidar — ``available`` reports False and ``read()``
-    returns None so the fused adapter simply omits lidar metrics.
+    Two DDS backends are attached concurrently and whichever actually DELIVERS a
+    cloud wins (the source then locks onto it, so counts never double):
 
-    The default topic is the Livox MID-360 cloud the Unitree firmware publishes
-    (``rt/utlidar/cloud_livox_mid360``); the legacy Go2 ``rt/utlidar/cloud`` can
-    be selected explicitly. Override with the ``KOVIO_LIDAR_TOPIC`` env var.
+    * ``ros2_livox`` — the Livox ROS 2 topic ``/livox/lidar`` (DDS name
+      ``rt/livox/lidar``), read straight off cyclonedds with **best-effort** QoS
+      to match the sensor-data publisher. This is how the Unitree **G1** exposes
+      its Livox MID-360; ``rclpy`` is *not* required (and isn't importable in the
+      SDK's Python anyway), so we speak DDS directly via the ``cyclonedds``
+      bindings that ship with ``unitree_sdk2py``.
+    * ``unitree_dds`` — the Unitree firmware cloud (``rt/utlidar/cloud_livox_mid360``,
+      or the legacy Go2 ``rt/utlidar/cloud``) via ``unitree_sdk2py``'s subscriber.
+
+    Construction NEVER raises on a host without a lidar — ``available`` reports
+    False and ``read()`` returns None so the fused adapter simply omits lidar
+    metrics. Init is also RETRIED lazily on every ``read()``: a backend that
+    couldn't start yet (e.g. ``eth0`` had no address at boot, or the Livox driver
+    wasn't up) is re-attempted, so the lidar recovers WITHOUT a process restart —
+    the fix for the boot-time race that used to disable it for the whole run.
+
+    Env overrides: ``KOVIO_LIDAR_BACKEND`` (``auto`` | ``ros2`` | ``unitree_dds``
+    | ``off``), ``KOVIO_LIDAR_TOPIC`` (unitree DDS topic), ``KOVIO_LIDAR_ROS2_TOPIC``
+    (default ``rt/livox/lidar``), ``KOVIO_LIDAR_NET_IFACE`` (default ``eth0``).
     """
 
     def __init__(
@@ -175,84 +193,235 @@ class LidarSource:
         network_interface: str = "eth0",
         topic: str = "rt/utlidar/cloud_livox_mid360",
         entry_gate_m: float = 0.8,
+        ros2_topic: str = "rt/livox/lidar",
+        retry_seconds: float = 5.0,
     ) -> None:
-        import os
-
         self.radius_m = radius_m
         self._entry_gate_m = entry_gate_m
+        self._retry_s = retry_seconds
         self._latest: CrowdReading | None = None
         # unique "people passed by" accounting (frame-to-frame body matching).
         self._prev_xy: list[tuple[float, float]] = []
         self._passed_accum = 0
-        self._sub = None
-        self._backend = None
-        # Resolved topic is kept so diagnostics (`kovio doctor`) can report which
-        # DDS topic this source is (or would be) listening on.
-        self._topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
-        try:
-            self._init_unitree_dds(network_interface, self._topic)
-            self._backend = "unitree_dds"
-        except Exception as e:  # noqa: BLE001 - any failure means "no lidar here"
-            log.info("lidar: unitree DDS backend unavailable (%s)", e)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        # The backend that first delivered a cloud; once set, others are ignored.
+        self._active_backend: str | None = None
+
+        self._iface = os.environ.get("KOVIO_LIDAR_NET_IFACE", network_interface)
+        self._dds_topic = os.environ.get("KOVIO_LIDAR_TOPIC", topic)
+        self._ros2_topic = os.environ.get("KOVIO_LIDAR_ROS2_TOPIC", ros2_topic)
+        self._backend_pref = os.environ.get("KOVIO_LIDAR_BACKEND", "auto").lower()
+
+        self._dds_sub = None
+        self._ros2_reader = None
+        self._started = {"unitree_dds": False, "ros2_livox": False}
+        # The Unitree SDK owns the process-wide cyclonedds domain (and binds it to
+        # the robot NIC); when present we bring it up FIRST and let both readers
+        # join domain 0, rather than racing a bare participant onto it.
+        self._factory_ready = False
+        self._last_attempt = 0.0
+        self._ensure_started(force=True)
+
+    # ---- public surface ------------------------------------------------- #
 
     @property
     def available(self) -> bool:
-        return self._backend is not None
+        """True once at least one backend has a live listener attached."""
+        return any(self._started.values())
 
     @property
     def backend(self) -> str | None:
-        """The active backend name (e.g. ``"unitree_dds"``), or None when no
-        lidar could be attached on this host."""
-        return self._backend
+        """The backend delivering data (once one does), else the first attached
+        listener, else None when no lidar could be attached on this host."""
+        if self._active_backend:
+            return self._active_backend
+        return next((b for b, up in self._started.items() if up), None)
 
     @property
     def topic(self) -> str:
-        """The DDS pointcloud topic this source subscribes to."""
-        return self._topic
-
-    def _init_unitree_dds(self, iface: str, topic: str) -> None:
-        from unitree_sdk2py.core.channel import (  # type: ignore
-            ChannelFactoryInitialize,
-            ChannelSubscriber,
-        )
-        from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_  # type: ignore
-
-        ChannelFactoryInitialize(0, iface)
-        self._sub = ChannelSubscriber(topic, PointCloud2_)
-        self._sub.Init(self._on_cloud, 10)
-
-    def _on_cloud(self, msg) -> None:
-        try:
-            pts = self._decode_pointcloud2(msg)
-            reading = analyze_pointcloud(pts, radius_m=self.radius_m)
-            curr_xy = _polar_to_xy(reading.people)
-            self._passed_accum += count_new_entries(
-                self._prev_xy, curr_xy, self._entry_gate_m
-            )
-            self._prev_xy = curr_xy
-            self._latest = reading
-        except Exception:
-            log.exception("lidar: failed to process cloud")
-
-    @staticmethod
-    def _decode_pointcloud2(msg) -> list:
-        """Decode a ROS-style PointCloud2 (x,y,z float32 fields) to a list."""
-        import struct
-
-        step = msg.point_step
-        data = bytes(msg.data)
-        out = []
-        for off in range(0, len(data), step):
-            x, y, z = struct.unpack_from("<fff", data, off)
-            out.append((x, y, z))
-        return out
+        """The topic this source is receiving on (or listening on if not yet
+        locked). Reported by ``kovio doctor``."""
+        if self._active_backend == "ros2_livox":
+            return self._ros2_topic
+        if self._active_backend == "unitree_dds":
+            return self._dds_topic
+        listening = []
+        if self._started.get("ros2_livox"):
+            listening.append(self._ros2_topic)
+        if self._started.get("unitree_dds"):
+            listening.append(self._dds_topic)
+        return ", ".join(listening) or self._dds_topic
 
     def read(self) -> CrowdReading | None:
-        """Most recent crowd reading, or None if no lidar is attached."""
+        """Most recent crowd reading, or None if no lidar is delivering yet.
+
+        Also drives lazy (re)connection, so a backend that wasn't ready at
+        construction time is retried here until it starts producing clouds.
+        """
+        self._ensure_started()
         return self._latest
 
     def take_passed(self) -> int:
         """Unique bodies that ENTERED the lidar field since the last call, then
         reset. Summed in the cloud into a cumulative "people passed by" count."""
-        n, self._passed_accum = self._passed_accum, 0
+        with self._lock:
+            n, self._passed_accum = self._passed_accum, 0
         return n
+
+    def close(self) -> None:
+        self._stop.set()
+
+    # ---- backend lifecycle ---------------------------------------------- #
+
+    @staticmethod
+    def _unitree_importable() -> bool:
+        import importlib.util
+
+        return importlib.util.find_spec("unitree_sdk2py") is not None
+
+    def _ensure_started(self, force: bool = False) -> None:
+        """Attempt to start any not-yet-running backend, rate-limited to one try
+        per ``retry_seconds`` so a persistently-absent lidar costs almost nothing.
+
+        Ordering matters: when the Unitree SDK is present it must initialise the
+        shared cyclonedds domain (bound to the robot NIC) BEFORE any bare
+        participant, or the domain gets created on the wrong interface and the
+        Unitree subscriber can never attach. So we gate the ROS 2 reader on the
+        factory being ready, and both come up together once ``eth0`` has an IP.
+        """
+        pref = self._backend_pref
+        if pref == "off":
+            return
+        want_ros2 = pref in ("auto", "ros2", "ros2_livox")
+        want_dds = pref in ("auto", "unitree_dds", "dds")
+        if (self._started["ros2_livox"] or not want_ros2) and (
+            self._started["unitree_dds"] or not want_dds
+        ):
+            return
+        now = time.monotonic()
+        if not force and now - self._last_attempt < self._retry_s:
+            return
+        self._last_attempt = now
+
+        # Explicit "ros2" skips the Unitree factory and uses a bare participant.
+        use_factory = want_dds and pref != "ros2" and self._unitree_importable()
+        if use_factory and not self._factory_ready:
+            try:
+                self._init_factory()
+                self._factory_ready = True
+            except Exception as e:  # noqa: BLE001 - eth0 not up yet, retry next tick
+                log.info("lidar: DDS domain not ready on %s (%s)", self._iface, e)
+                # Don't start a bare ROS 2 participant while the Unitree SDK still
+                # owns domain 0 — wait so both attach to the same NIC together.
+                return
+
+        if want_dds and self._factory_ready and not self._started["unitree_dds"]:
+            try:
+                self._start_unitree_dds_sub()
+                self._started["unitree_dds"] = True
+                log.info("lidar: unitree_dds backend listening on %s", self._dds_topic)
+            except Exception as e:  # noqa: BLE001
+                log.info("lidar: unitree_dds backend unavailable (%s)", e)
+        if want_ros2 and not self._started["ros2_livox"]:
+            try:
+                self._start_ros2_livox()
+                self._started["ros2_livox"] = True
+                log.info("lidar: ros2_livox backend listening on %s", self._ros2_topic)
+            except Exception as e:  # noqa: BLE001 - no ros2/cyclonedds here is fine
+                log.info("lidar: ros2_livox backend unavailable (%s)", e)
+
+    def _init_factory(self) -> None:
+        """Bring up the Unitree SDK's shared cyclonedds domain, bound to the NIC."""
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # type: ignore
+
+        ChannelFactoryInitialize(0, self._iface)
+
+    def _start_unitree_dds_sub(self) -> None:
+        from unitree_sdk2py.core.channel import ChannelSubscriber  # type: ignore
+        from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_  # type: ignore
+
+        self._dds_sub = ChannelSubscriber(self._dds_topic, PointCloud2_)
+        self._dds_sub.Init(lambda msg: self._ingest("unitree_dds", msg), 10)
+
+    def _start_ros2_livox(self) -> None:
+        """Subscribe to the Livox ROS 2 cloud straight off cyclonedds (no rclpy),
+        with best-effort QoS so a ROS 2 sensor-data publisher actually matches."""
+        from cyclonedds.domain import DomainParticipant  # type: ignore
+        from cyclonedds.qos import Policy, Qos  # type: ignore
+        from cyclonedds.sub import DataReader  # type: ignore
+        from cyclonedds.topic import Topic  # type: ignore
+        from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_  # type: ignore
+
+        qos = Qos(
+            Policy.Reliability.BestEffort,
+            Policy.History.KeepLast(4),
+            Policy.Durability.Volatile,
+        )
+        participant = DomainParticipant(0)
+        topic = Topic(participant, self._ros2_topic, PointCloud2_, qos=qos)
+        self._ros2_reader = DataReader(participant, topic, qos=qos)
+        # Hold refs so they aren't GC'd out from under the reader.
+        self._ros2_participant = participant
+        self._ros2_topic_obj = topic
+        threading.Thread(
+            target=self._ros2_poll_loop, name="kovio-lidar-ros2", daemon=True
+        ).start()
+
+    def _ros2_poll_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                samples = self._ros2_reader.take(N=8)
+            except Exception:
+                samples = []
+            for s in samples or []:
+                msg = getattr(s, "data", s)  # cyclonedds may wrap in a sample
+                self._ingest("ros2_livox", msg)
+            time.sleep(0.05)
+
+    # ---- shared ingest -------------------------------------------------- #
+
+    def _ingest(self, backend_name: str, msg) -> None:
+        """Decode a PointCloud2 from either backend into the latest reading.
+
+        The first backend to deliver a cloud LOCKS the source (``_active_backend``)
+        so a second backend that's also up can't double-count "passed" bodies.
+        """
+        with self._lock:
+            if self._active_backend is None:
+                self._active_backend = backend_name
+                log.info("lidar: receiving clouds via %s", backend_name)
+            elif self._active_backend != backend_name:
+                return
+        try:
+            pts = self._decode_pointcloud2(msg)
+            reading = analyze_pointcloud(pts, radius_m=self.radius_m)
+            curr_xy = _polar_to_xy(reading.people)
+            with self._lock:
+                self._passed_accum += count_new_entries(
+                    self._prev_xy, curr_xy, self._entry_gate_m
+                )
+                self._prev_xy = curr_xy
+                self._latest = reading
+        except Exception:
+            log.exception("lidar: failed to process cloud")
+
+    @staticmethod
+    def _decode_pointcloud2(msg) -> list:
+        """Decode a ROS-style PointCloud2 (x,y,z float32) to a list of (x,y,z).
+
+        Reads the actual x/y/z field offsets so it handles both the Unitree cloud
+        and the Livox cloud (which carry intensity/tag/etc. after xyz)."""
+        step = msg.point_step
+        data = bytes(msg.data)
+        off = {f.name: f.offset for f in msg.fields} if getattr(msg, "fields", None) else {}
+        ox, oy, oz = off.get("x", 0), off.get("y", 4), off.get("z", 8)
+        out = []
+        n = len(data) // step if step else 0
+        for i in range(n):
+            base = i * step
+            x = struct.unpack_from("<f", data, base + ox)[0]
+            y = struct.unpack_from("<f", data, base + oy)[0]
+            z = struct.unpack_from("<f", data, base + oz)[0]
+            out.append((x, y, z))
+        return out

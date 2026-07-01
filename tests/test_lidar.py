@@ -1,5 +1,8 @@
 """Lidar crowd-analysis tests — synthetic pointclouds, pure math."""
 import math
+import struct
+
+import pytest
 
 from kovio.adapters.lidar import analyze_pointcloud, CrowdReading
 
@@ -95,15 +98,67 @@ def test_count_new_entries_pure():
     assert count_new_entries([(1.0, 0.0)], [(4.0, 0.0)], gate_m=0.8) == 1
 
 
-def test_lidar_source_reports_backend_and_topic(monkeypatch):
-    """`kovio doctor` reads these to flag a dead lidar before a live demo:
-    construction never raises on a host without a lidar, `available`/`backend`
-    reflect that, `topic` honours the env override, and `read()` starts empty."""
+class _Field:
+    def __init__(self, name, offset):
+        self.name = name
+        self.offset = offset
+
+
+class _FakePC2:
+    """A minimal ROS PointCloud2: x,y,z float32 then an intensity float32."""
+
+    def __init__(self, points):
+        self.point_step = 16
+        self.fields = [_Field("x", 0), _Field("y", 4), _Field("z", 8),
+                       _Field("intensity", 12)]
+        buf = bytearray()
+        for x, y, z in points:
+            buf += struct.pack("<ffff", x, y, z, 1.0)
+        self.data = bytes(buf)
+
+
+def test_lidar_backend_off_is_inert(monkeypatch):
+    """With the backend disabled, construction never touches DDS and every field
+    reports 'no lidar' — the safe degrade `kovio doctor` relies on."""
     from kovio.adapters.lidar import LidarSource
 
+    monkeypatch.setenv("KOVIO_LIDAR_BACKEND", "off")
     monkeypatch.setenv("KOVIO_LIDAR_TOPIC", "rt/utlidar/cloud")
     src = LidarSource(network_interface="does-not-exist0")
 
-    assert src.topic == "rt/utlidar/cloud"          # env override wins
-    assert src.available == (src.backend is not None)
-    assert src.read() is None                        # no cloud yet -> no frame
+    assert src.available is False
+    assert src.backend is None
+    assert src.topic == "rt/utlidar/cloud"     # env override, nothing attached
+    assert src.read() is None
+
+
+def test_lidar_decode_pointcloud2_uses_field_offsets():
+    """Decoding reads the real x/y/z offsets, so a Livox cloud with trailing
+    intensity/tag columns still yields the right (x,y,z)."""
+    from kovio.adapters.lidar import LidarSource
+
+    pts = LidarSource._decode_pointcloud2(_FakePC2([(1.0, 2.0, 3.0), (-1.0, 0.5, 0.2)]))
+    assert len(pts) == 2
+    assert pytest.approx(pts[0]) == (1.0, 2.0, 3.0)
+    assert pytest.approx(pts[1]) == (-1.0, 0.5, 0.2)
+
+
+def test_lidar_ingest_locks_backend_and_counts(monkeypatch):
+    """A cloud from either backend produces a reading; the first backend to
+    deliver LOCKS the source so a second one can't double-count 'passed'."""
+    from kovio.adapters.lidar import LidarSource
+
+    monkeypatch.setenv("KOVIO_LIDAR_BACKEND", "off")
+    src = LidarSource(radius_m=4.0)
+    assert src.read() is None
+
+    src._ingest("ros2_livox", _FakePC2(_blob(1.0, 0.5) + _blob(2.5, -1.0)))
+    reading = src.read()
+    assert reading is not None and reading.people_nearby == 2
+    assert src.backend == "ros2_livox"
+    assert src.take_passed() == 2               # two bodies entered the field
+
+    # once locked to ros2_livox, a unitree_dds cloud is ignored (no double count)
+    src._ingest("unitree_dds", _FakePC2(_blob(1.2, 0.0)))
+    assert src.backend == "ros2_livox"
+    assert src.take_passed() == 0
