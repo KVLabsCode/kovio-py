@@ -145,6 +145,10 @@ class KovioAgent:
                 robot_id=effective_robot_id,
                 frame_source=frame_source,
                 timeout=config.api_timeout_seconds,
+                # V2 audience moments ride the same session poll (created by the
+                # rich adapter in start(); None on camera-only adapters is fine —
+                # the streamer then only relays frames).
+                audience_engine=getattr(perception, "audience_engine", None),
             )
 
         return cls(

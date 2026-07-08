@@ -35,6 +35,7 @@ class SessionStreamer:
         poll_interval_seconds: float = 5.0,
         jpeg_quality: int = 70,
         timeout: float = _DEFAULT_TIMEOUT,
+        audience_engine=None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -43,6 +44,11 @@ class SessionStreamer:
         self.poll_interval = poll_interval_seconds
         self.jpeg_quality = jpeg_quality
         self.timeout = timeout
+        # V2: while a session is open, the AudienceEngine's moments (passerby /
+        # dwell / close_approach) are drained and uploaded alongside the frames,
+        # with a sensor-health snapshot so the dashboard can show DEGRADED
+        # instead of a silent zero when a sensor dies mid-session.
+        self._engine = audience_engine
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -84,8 +90,21 @@ class SessionStreamer:
         if active != self._active:
             log.info("session %s", "OPEN — streaming frames" if active else "closed")
             self._active = active
+            if self._engine is not None:
+                if active:
+                    # Fresh session = fresh identity: track ids restart at 1 and
+                    # nothing links people across sessions (privacy posture).
+                    self._engine.set_encounter_cap(
+                        payload.get("encounter_cap_seconds")
+                    )
+                    self._engine.arm()
+                else:
+                    self._engine.disarm()
         if not active:
             return
+
+        if self._engine is not None:
+            self._post_moments()
 
         jpeg = self._encode_latest()
         if jpeg is None:
@@ -107,6 +126,34 @@ class SessionStreamer:
         if not ok:
             return None
         return buf.tobytes()
+
+    def _post_moments(self) -> None:
+        """Upload drained audience moments + sensor health. Posted every tick
+        while a session is open (even with zero moments) so the dashboard's
+        sensor-health row stays live."""
+        import json
+
+        moments = self._engine.drain()
+        body = json.dumps(
+            {"moments": moments, "sensor": self._engine.health()}
+        ).encode("utf-8")
+        qs = parse.urlencode({"robot_id": self.robot_id})
+        req = request.Request(
+            f"{self.api_url}/session/v1/moments?{qs}", data=body, method="POST"
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with request.urlopen(req, timeout=self.timeout):
+                pass
+        except error.HTTPError as e:
+            # 409 = session closed between poll and post; normal, next tick idles.
+            if e.code != 409:
+                log.warning("session.moments.http_error status=%s", e.code)
+                self._engine.requeue(moments)
+        except (error.URLError, TimeoutError, OSError) as e:
+            log.warning("session.moments.network_error %s", e)
+            self._engine.requeue(moments)
 
     def _post_frame(self, jpeg: bytes) -> None:
         qs = parse.urlencode({"robot_id": self.robot_id})

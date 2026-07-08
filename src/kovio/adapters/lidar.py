@@ -195,8 +195,13 @@ class LidarSource:
         entry_gate_m: float = 0.8,
         ros2_topic: str = "rt/livox/lidar,rt/utlidar/cloud_livox_mid360",
         retry_seconds: float = 5.0,
+        engine=None,
     ) -> None:
         self.radius_m = radius_m
+        # Optional AudienceEngine: when set it does the clustering/tracking per
+        # cloud (the V2 moments) and this source derives its CrowdReading from
+        # the engine's clusters instead of running analyze_pointcloud twice.
+        self._engine = engine
         self._entry_gate_m = entry_gate_m
         self._retry_s = retry_seconds
         self._latest: CrowdReading | None = None
@@ -414,7 +419,11 @@ class LidarSource:
                 return
         try:
             pts = self._decode_pointcloud2(msg)
-            reading = analyze_pointcloud(pts, radius_m=self.radius_m)
+            if self._engine is not None:
+                clusters = self._engine.ingest_points(pts)
+                reading = self._reading_from_clusters(clusters)
+            else:
+                reading = analyze_pointcloud(pts, radius_m=self.radius_m)
             curr_xy = _polar_to_xy(reading.people)
             with self._lock:
                 self._passed_accum += count_new_entries(
@@ -425,18 +434,48 @@ class LidarSource:
         except Exception:
             log.exception("lidar: failed to process cloud")
 
-    @staticmethod
-    def _decode_pointcloud2(msg) -> list:
-        """Decode a ROS-style PointCloud2 (x,y,z float32) to a list of (x,y,z).
+    def _reading_from_clusters(self, clusters) -> CrowdReading:
+        """CrowdReading from the engine's clusters (already nearest-first)."""
+        within = [c for c in clusters if c.range_m <= self.radius_m]
+        density = len(within) / (math.pi * self.radius_m**2)
+        if not within:
+            return CrowdReading(0, round(density, 4), None, None)
+        positions = tuple(
+            (round(c.range_m, 2), round(c.bearing_deg, 1)) for c in within
+        )
+        return CrowdReading(
+            len(within),
+            round(density, 4),
+            positions[0][0],
+            positions[0][1],
+            positions,
+        )
 
-        Reads the actual x/y/z field offsets so it handles both the Unitree cloud
-        and the Livox cloud (which carry intensity/tag/etc. after xyz)."""
+    @staticmethod
+    def _decode_pointcloud2(msg):
+        """Decode a ROS-style PointCloud2 (x,y,z float32) to Nx3 (x,y,z).
+
+        Reads the actual x/y/z field offsets so it handles both the Unitree
+        cloud and the Livox cloud (which carry intensity/tag/etc. after xyz).
+        numpy path handles the MID-360's ~200k pts/s; the pure-python loop is a
+        fallback so hosts without numpy still get crowd metrics."""
         step = msg.point_step
         data = bytes(msg.data)
         off = {f.name: f.offset for f in msg.fields} if getattr(msg, "fields", None) else {}
         ox, oy, oz = off.get("x", 0), off.get("y", 4), off.get("z", 8)
-        out = []
         n = len(data) // step if step else 0
+        try:
+            import numpy as np
+
+            buf = np.frombuffer(data, dtype=np.uint8, count=n * step).reshape(n, step)
+
+            def col(o):
+                return buf[:, o : o + 4].copy().view(np.float32).ravel()
+
+            return np.stack([col(ox), col(oy), col(oz)], axis=1)
+        except ImportError:
+            pass
+        out = []
         for i in range(n):
             base = i * step
             x = struct.unpack_from("<f", data, base + ox)[0]

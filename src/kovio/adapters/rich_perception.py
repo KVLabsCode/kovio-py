@@ -91,6 +91,14 @@ class RichPerceptionAdapter(PerceptionAdapter):
         self._gestures = GestureClassifier()
         self._last_fired: dict[tuple[int, str], float] = {}
         self._phone_state: dict[int, bool] = {}
+        # V2 audience metrics engine (passerby/dwell/close-approach moments).
+        # Created eagerly — it's dependency-light — so the SessionStreamer can
+        # be wired to it at autodetect time, before start() runs.
+        self.audience_engine = None
+        if enable_lidar:
+            from .audience import AudienceEngine
+
+            self.audience_engine = AudienceEngine()
 
     # ------------------------------------------------------------------ #
 
@@ -146,7 +154,11 @@ class RichPerceptionAdapter(PerceptionAdapter):
     def _make_lidar(self):
         from .lidar import LidarSource
 
-        return LidarSource(radius_m=self._lidar_radius, network_interface=self._iface)
+        return LidarSource(
+            radius_m=self._lidar_radius,
+            network_interface=self._iface,
+            engine=self.audience_engine,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -162,24 +174,65 @@ class RichPerceptionAdapter(PerceptionAdapter):
 
     # ------------------------------------------------------------------ #
 
+    _CAMERA_RETRY_S = 10.0
+
     def _run(self, on_scene, rs, det, pose, person_det, phone_det, gaze_cascade, lidar):
         import numpy as np
 
-        pipeline = rs.pipeline()
         config = rs.config()
         config.enable_stream(rs.stream.color, self._width, self._height, rs.format.bgr8, 30)
         config.enable_stream(rs.stream.depth, self._width, self._height, rs.format.z16, 30)
         align = rs.align(rs.stream.color)
-        pipeline.start(config)
         log.info("rich perception started (cadence=%.2fs)", self._cadence)
 
+        # The camera is OPTIONAL at runtime: if the RealSense is off the bus
+        # (or falls off mid-run) we keep emitting lidar-only scenes and retry
+        # the pipeline every few seconds, so a USB flake degrades metrics
+        # instead of blinding the whole agent.
+        pipeline = None
+        camera_logged_down = False
         last_emit = 0.0
+        last_cam_try = 0.0
         misses = 0
+
+        def drop_camera(reason: str):
+            nonlocal pipeline
+            log.warning("camera dropped (%s); continuing lidar-only", reason)
+            try:
+                if pipeline is not None:
+                    pipeline.stop()
+            except Exception:
+                pass
+            pipeline = None
+
         try:
             while not self._stop.is_set():
-                # A transient frame timeout must NOT kill perception. Count
-                # consecutive misses; after a run of them, rebuild the pipeline
-                # (recovers a hung/dropped RealSense) instead of dying.
+                now = time.time()
+                if pipeline is None:
+                    if now - last_cam_try >= self._CAMERA_RETRY_S or last_cam_try == 0.0:
+                        last_cam_try = now
+                        try:
+                            pipeline = rs.pipeline()
+                            pipeline.start(config)
+                            misses = 0
+                            camera_logged_down = False
+                            log.info("camera pipeline up")
+                        except Exception as e:
+                            pipeline = None
+                            if not camera_logged_down:
+                                log.warning(
+                                    "camera unavailable (%s); lidar-only until it returns", e
+                                )
+                                camera_logged_down = True
+                    if pipeline is None:
+                        if now - last_emit >= self._cadence:
+                            last_emit = now
+                            if self.audience_engine is not None:
+                                self.audience_engine.set_camera(None)
+                            self._emit_safe(on_scene, self._lidar_only_scene(lidar, now))
+                        self._stop.wait(0.25)
+                        continue
+
                 try:
                     frames = pipeline.wait_for_frames(timeout_ms=2000)
                     misses = 0
@@ -187,17 +240,7 @@ class RichPerceptionAdapter(PerceptionAdapter):
                     misses += 1
                     log.warning("frame wait failed (%d in a row): %s", misses, e)
                     if misses >= 5:
-                        log.error("no frames after %d tries; restarting pipeline", misses)
-                        try:
-                            pipeline.stop()
-                        except Exception:
-                            pass
-                        try:
-                            pipeline.start(config)
-                            misses = 0
-                        except Exception:
-                            log.exception("pipeline restart failed; retrying")
-                            time.sleep(2.0)
+                        drop_camera(f"no frames after {misses} tries")
                     continue
                 aligned = align.process(frames)
                 color = aligned.get_color_frame()
@@ -220,13 +263,61 @@ class RichPerceptionAdapter(PerceptionAdapter):
                 except Exception:
                     log.exception("perception failed; emitting empty scene")
                     scene = SceneState(0, 0, None)
-                try:
-                    on_scene(scene)
-                except Exception:
-                    log.exception("on_scene callback raised")
+                self._emit_safe(on_scene, scene)
         finally:
-            pipeline.stop()
+            if pipeline is not None:
+                pipeline.stop()
             log.info("rich perception stopped")
+
+    @staticmethod
+    def _emit_safe(on_scene, scene) -> None:
+        try:
+            on_scene(scene)
+        except Exception:
+            log.exception("on_scene callback raised")
+
+    def _lidar_only_scene(self, lidar, now: float) -> SceneState:
+        """Scene emitted while the camera is dark: zeros for the camera-derived
+        fields, real crowd context from the lidar so V2 metrics keep flowing."""
+        people_nearby = crowd_density = nearest = bearing = None
+        lidar_people = lidar_passed = None
+        if lidar is not None:
+            reading = lidar.read()
+            if reading is not None:
+                people_nearby = reading.people_nearby
+                crowd_density = reading.crowd_density
+                nearest = reading.nearest_distance_m
+                bearing = reading.approach_bearing_deg
+                lidar_people = reading.people
+                lidar_passed = lidar.take_passed()
+        return SceneState(
+            person_count=0,
+            attended_count=0,
+            mean_distance_m=None,
+            people_nearby=people_nearby,
+            crowd_density=crowd_density,
+            nearest_distance_m=nearest,
+            approach_bearing_deg=bearing,
+            lidar_people=lidar_people,
+            lidar_passed=lidar_passed,
+            timestamp=now,
+        )
+
+    def _near_depth_m(self, depth) -> float | None:
+        """Nearest solid depth in the camera cone — a robust percentile over the
+        raw depth image, so one hot pixel can't fake a close approach and a
+        body 40 cm from the lens (too close for YOLO to box) still registers."""
+        import numpy as np
+
+        try:
+            units = depth.get_units()
+            d = np.asanyarray(depth.get_data()).astype(np.float32) * units
+        except Exception:
+            return None
+        valid = d[(d > 0.15) & (d < 4.0)]
+        if valid.size < 200:  # too few returns to trust (lens covered / dark)
+            return None
+        return round(float(np.percentile(valid, 5)), 3)
 
     def _depth_at(self, depth, px, py) -> float | None:
         if 0 <= px < self._width and 0 <= py < self._height:
@@ -335,6 +426,17 @@ class RichPerceptionAdapter(PerceptionAdapter):
         # Emit confirmed-people metrics: a flickering false positive never
         # reaches min_hits, so it contributes to none of these.
         conf_dists = [t.distance_m for t in confirmed if t.distance_m is not None]
+
+        # Feed the audience engine its camera context: the nearest solid depth
+        # return (close-approach primary signal) and confirmed person ranges
+        # (dwell corroboration). Never let fusion break perception.
+        if self.audience_engine is not None:
+            try:
+                self.audience_engine.set_camera(
+                    self._near_depth_m(depth), conf_dists, now=now
+                )
+            except Exception:
+                log.exception("audience camera feed failed")
         mean_d = sum(conf_dists) / len(conf_dists) if conf_dists else None
         attended_confirmed = sum(
             1 for t in confirmed if t.distance_m is not None and t.distance_m <= self._attn
