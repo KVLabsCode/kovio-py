@@ -390,7 +390,11 @@ class LidarSource:
                 except Exception:
                     samples = []
                 for s in samples or []:
-                    msg = getattr(s, "data", s)  # cyclonedds may wrap in a sample
+                    # cyclonedds may hand back the message itself or wrap it in a
+                    # sample; probe for a PointCloud2 field before unwrapping,
+                    # because the message's own ``data`` (the point bytes) shadows
+                    # a sample wrapper's ``data`` attribute.
+                    msg = s if hasattr(s, "point_step") else getattr(s, "data", s)
                     self._ingest("ros2_livox", msg)
             time.sleep(0.05)
 
