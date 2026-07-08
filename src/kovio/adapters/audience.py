@@ -108,6 +108,10 @@ def extract_clusters(
     points,
     *,
     radius_m: float = 4.5,
+    # The MID-360 sits on the robot and sees the G1's own shoulders/arms as
+    # near returns (observed ~0.27 m); anything this close can't be a separate
+    # person's body centre, so it's self-geometry — excluded.
+    min_range_m: float = 0.45,
     z_min: float = 0.15,
     z_max: float = 1.9,
     cell_m: float = 0.15,
@@ -133,7 +137,12 @@ def extract_clusters(
 
     z = pts[:, 2]
     r2 = pts[:, 0] ** 2 + pts[:, 1] ** 2
-    keep = (z >= z_min) & (z <= z_max) & (r2 <= radius_m * radius_m) & (r2 > 0.01)
+    keep = (
+        (z >= z_min)
+        & (z <= z_max)
+        & (r2 <= radius_m * radius_m)
+        & (r2 >= min_range_m * min_range_m)
+    )
     xy = pts[keep, :2]
     if xy.shape[0] == 0:
         if background is not None:
