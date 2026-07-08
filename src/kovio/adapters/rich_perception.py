@@ -79,6 +79,10 @@ class RichPerceptionAdapter(PerceptionAdapter):
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Latest color frame, for the admin session live view. Guarded copy —
+        # the capture loop overwrites it every tick.
+        self._frame_lock = threading.Lock()
+        self._latest_bgr = None
         # min_hits=2: a detection must persist across two ticks to count as a
         # person, filtering single-tick detector flicker on background clutter.
         self._tracker = CentroidTracker(
@@ -150,6 +154,12 @@ class RichPerceptionAdapter(PerceptionAdapter):
             self._thread.join(timeout=5)
             self._thread = None
 
+    def latest_frame_bgr(self):
+        """Most recent color frame (BGR ndarray copy), or None before first
+        capture. Feeds the admin session live view; never blocks the loop."""
+        with self._frame_lock:
+            return self._latest_bgr
+
     # ------------------------------------------------------------------ #
 
     def _run(self, on_scene, rs, det, pose, person_det, phone_det, gaze_cascade, lidar):
@@ -200,6 +210,8 @@ class RichPerceptionAdapter(PerceptionAdapter):
                 last_emit = now
 
                 bgr = np.asanyarray(color.get_data())
+                with self._frame_lock:
+                    self._latest_bgr = bgr.copy()
                 try:
                     scene = self._build_scene(
                         bgr, depth, now, det, pose, person_det,

@@ -1,0 +1,126 @@
+"""SessionStreamer — live-view uploader for admin sessions.
+
+Polls ``GET /session/v1/current`` with the fleet key every few seconds; while
+an admin has a session open for this robot, JPEG-encodes the perception
+adapter's latest color frame and POSTs it to the in-RAM relay at
+``POST /session/v1/frame``. Frames are only ever the latest single JPEG in
+cloud process RAM — nothing is recorded on disk or in the database, and when
+no session is open this thread does nothing but the light 5s poll.
+
+Runs alongside CloudEventSink with the same key/url and the same
+never-crash-the-agent posture: every network error is swallowed and retried on
+the next tick.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Callable
+from urllib import error, parse, request
+
+from .cloud import _DEFAULT_TIMEOUT, _get_json
+
+log = logging.getLogger("kovio.session")
+
+
+class SessionStreamer:
+    """Background thread: poll for an open session, stream frames while one is."""
+
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        robot_id: str,
+        frame_source: Callable[[], "object | None"],
+        poll_interval_seconds: float = 5.0,
+        jpeg_quality: int = 70,
+        timeout: float = _DEFAULT_TIMEOUT,
+    ) -> None:
+        self.api_url = api_url.rstrip("/")
+        self.api_key = api_key
+        self.robot_id = robot_id
+        self._frame_source = frame_source
+        self.poll_interval = poll_interval_seconds
+        self.jpeg_quality = jpeg_quality
+        self.timeout = timeout
+
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._active = False  # last known session state, for edge logging
+
+    def start(self) -> None:
+        if self._thread:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="kovio-session-stream"
+        )
+        self._thread.start()
+        log.info("session.stream.started (poll=%.0fs)", self.poll_interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    # ---- internals ----
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                log.exception("session.stream.tick_failed")
+            self._stop.wait(self.poll_interval)
+
+    def _tick(self) -> None:
+        qs = parse.urlencode({"robot_id": self.robot_id})
+        status, payload = _get_json(
+            f"{self.api_url}/session/v1/current?{qs}",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=self.timeout,
+        )
+        active = bool(payload and payload.get("active"))
+        if active != self._active:
+            log.info("session %s", "OPEN — streaming frames" if active else "closed")
+            self._active = active
+        if not active:
+            return
+
+        jpeg = self._encode_latest()
+        if jpeg is None:
+            return
+        self._post_frame(jpeg)
+
+    def _encode_latest(self) -> bytes | None:
+        frame = self._frame_source()
+        if frame is None:
+            return None
+        try:
+            import cv2
+        except ImportError:
+            log.warning("session.stream: cv2 unavailable; cannot encode frames")
+            return None
+        ok, buf = cv2.imencode(
+            ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        )
+        if not ok:
+            return None
+        return buf.tobytes()
+
+    def _post_frame(self, jpeg: bytes) -> None:
+        qs = parse.urlencode({"robot_id": self.robot_id})
+        req = request.Request(
+            f"{self.api_url}/session/v1/frame?{qs}", data=jpeg, method="POST"
+        )
+        req.add_header("Content-Type", "image/jpeg")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with request.urlopen(req, timeout=self.timeout):
+                pass
+        except error.HTTPError as e:
+            # 409 = session closed between poll and post; normal, next tick idles.
+            if e.code != 409:
+                log.warning("session.frame.http_error status=%s", e.code)
+        except (error.URLError, TimeoutError, OSError) as e:
+            log.warning("session.frame.network_error %s", e)

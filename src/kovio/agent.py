@@ -51,6 +51,7 @@ class KovioAgent:
         api_key: str | None = None,
         store: "CampaignStore | None" = None,  # noqa: F821 (forward ref)
         sink: "CloudEventSink | None" = None,  # noqa: F821 (forward ref)
+        session_streamer: "SessionStreamer | None" = None,  # noqa: F821 (forward ref)
     ) -> None:
         self.robot_id = robot_id
         self.screen = screen or ScreenAdapter.logger()
@@ -65,6 +66,7 @@ class KovioAgent:
         self.creative_url = creative_url or _default_creative_url()
         self.api_key = api_key
         self._sink = sink
+        self._session_streamer = session_streamer
 
         self._task_state = TaskState.IDLE
         self._last_scene: SceneState | None = None
@@ -129,12 +131,29 @@ class KovioAgent:
 
         perception = kwargs.pop("perception", None) or make_perception_adapter()
         screen = kwargs.pop("screen", None) or make_screen_adapter()
+
+        # Admin live view: only when cloud-configured AND the adapter can hand
+        # over frames (rich/RealSense). Idle cost is one 5s poll; frames leave
+        # the robot only while an admin session is open.
+        session_streamer = kwargs.pop("session_streamer", None)
+        frame_source = getattr(perception, "latest_frame_bgr", None)
+        if config.is_configured and session_streamer is None and frame_source is not None:
+            from .session_stream import SessionStreamer
+            session_streamer = SessionStreamer(
+                api_url=config.api_url,
+                api_key=config.api_key,
+                robot_id=effective_robot_id,
+                frame_source=frame_source,
+                timeout=config.api_timeout_seconds,
+            )
+
         return cls(
             robot_id=effective_robot_id,
             perception=perception,
             screen=screen,
             store=store,
             sink=sink,
+            session_streamer=session_streamer,
             **kwargs,
         )
 
@@ -147,11 +166,15 @@ class KovioAgent:
         self._emit("agent_started", {"version": __version__})
         if self._sink is not None:
             self._sink.start()
+        if self._session_streamer is not None:
+            self._session_streamer.start()
         self.perception.start(self._handle_scene)
 
     def stop(self) -> None:
         log.info("stopping agent")
         self.perception.stop()
+        if self._session_streamer is not None:
+            self._session_streamer.stop()
         if self._sink is not None:
             self._sink.stop()
         self.screen.clear()
