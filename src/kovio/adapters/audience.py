@@ -55,9 +55,12 @@ CLOSE_MIN_DURATION_S = 0.5
 # The D435i's horizontal FOV is ~87°; a lidar cluster within this half-angle of
 # straight ahead is "in the camera cone" for fusion checks.
 CAMERA_HALF_FOV_DEG = 50.0
-# A track must have travelled this far to produce moments — a pillar or parked
-# cart never moves, so static clutter can't become a "passerby" even before the
-# background model has learned it.
+# A track must displace this far FROM ITS BIRTH POSITION to produce moments —
+# a pillar or parked cart never gets far from where it appeared, so static
+# clutter can't become a "passerby" even before the background model has
+# learned it. Net displacement, deliberately not path length: centroid jitter
+# on a static cluster accrues ~0.5 m/s of fake path (observed live) but never
+# moves the body anywhere.
 MIN_TRAVEL_M = 0.4
 DEFAULT_ENCOUNTER_CAP_S = 300.0
 
@@ -250,7 +253,10 @@ class Track:
     y: float
     last_t: float
     min_range_m: float
-    travel_m: float = 0.0
+    born_x: float = 0.0
+    born_y: float = 0.0
+    # Set on resurrection: the person already proved they move in a past life.
+    proven_mover: bool = False
     counted_passerby: bool = False
     # Continuous time within the dwell radius (with exit hysteresis).
     dwell_since: float | None = None
@@ -268,7 +274,9 @@ class Track:
 
     @property
     def eligible(self) -> bool:
-        return self.travel_m >= MIN_TRAVEL_M
+        if self.proven_mover:
+            return True
+        return math.hypot(self.x - self.born_x, self.y - self.born_y) >= MIN_TRAVEL_M
 
 
 @dataclass
@@ -336,7 +344,6 @@ class AudienceTracker:
         for ti, ci in matched.items():
             tr = self.tracks[ti]
             c = clusters[ci]
-            tr.travel_m += math.hypot(c.cx - tr.x, c.cy - tr.y)
             tr.x, tr.y = c.cx, c.cy
             tr.last_t = now
             tr.misses = 0
@@ -380,12 +387,12 @@ class AudienceTracker:
                     Track(
                         track_id=revived.track_id, born_t=now,
                         x=c.cx, y=c.cy, last_t=now, min_range_m=c.range_m,
+                        born_x=c.cx, born_y=c.cy,
                         # Preserve what was already counted/emitted for this id.
                         counted_passerby=revived.counted_passerby,
                         dwell_s=revived.dwell_s,
                         dwell_tier_idx=revived.dwell_tier_idx,
-                        # A resurrected person already proved they move.
-                        travel_m=MIN_TRAVEL_M,
+                        proven_mover=True,
                     )
                 )
             else:
@@ -393,6 +400,7 @@ class AudienceTracker:
                     Track(
                         track_id=self._next_id, born_t=now,
                         x=c.cx, y=c.cy, last_t=now, min_range_m=c.range_m,
+                        born_x=c.cx, born_y=c.cy,
                     )
                 )
                 self._next_id += 1

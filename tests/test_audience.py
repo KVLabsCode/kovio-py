@@ -91,6 +91,19 @@ def test_static_pillar_never_counts():
     assert moments == []
 
 
+def test_jittering_static_object_never_counts():
+    # Regression: centroid jitter accrues path length (~0.5 m/s observed live)
+    # but no net displacement — it must not become a passerby or dwell.
+    tr = AudienceTracker()
+    t, moments = 0.0, []
+    for i in range(600):  # 60 s of a jittery blob well inside the dwell zone
+        jx = 0.06 * math.sin(i * 2.1)
+        jy = 0.06 * math.cos(i * 1.3)
+        moments += tr.update(_clusters_at((1.2 + jx, 0.1 + jy)), t)
+        t += 0.1
+    assert moments == []
+
+
 def test_double_pass_within_cap_is_one_reach():
     tr = AudienceTracker(encounter_cap_s=300.0)
     t, moments = 0.0, []
