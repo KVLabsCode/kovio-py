@@ -54,6 +54,21 @@ def test_extract_empty_and_out_of_band():
     assert extract_clusters(high) == []
 
 
+def test_two_legs_merge_into_one_body():
+    left = _blob3d(2.0, 0.75, n=25, spread=0.08)
+    right = _blob3d(2.0, 0.25, n=25, spread=0.08)  # 0.5 m apart: mid-stride
+    cl = extract_clusters(np.array(left + right, dtype=np.float32))
+    assert len(cl) == 1
+    assert abs(cl[0].cy - 0.5) < 0.12  # centroid lands between the legs
+
+
+def test_two_separate_people_stay_separate():
+    a = _blob3d(2.0, 1.0, n=25, spread=0.08)
+    b = _blob3d(2.0, -1.0, n=25, spread=0.08)  # 2 m apart
+    cl = extract_clusters(np.array(a + b, dtype=np.float32))
+    assert len(cl) == 2
+
+
 def test_background_model_absorbs_static_object():
     bg = BackgroundModel(alpha=0.2, threshold=0.7)  # fast alpha for the test
     cells = {(10, 10), (10, 11)}

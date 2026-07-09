@@ -121,6 +121,11 @@ def extract_clusters(
     min_points: int = 5,
     min_extent_m: float = 0.08,
     max_extent_m: float = 1.2,
+    # Grid components closer than this merge into one body: a mid-stride
+    # walker's legs are two components up to ~0.6 m apart, and counting each
+    # leg as a person doubles reach. Two people brushing shoulders merge too —
+    # undercounting beats inflating an advertiser-facing number.
+    merge_m: float = 0.7,
     background=None,
 ) -> list[Cluster]:
     """Points (Nx3 array-like) -> human-sized 2D clusters.
@@ -202,8 +207,39 @@ def extract_clusters(
         if extent < min_extent_m or extent > max_extent_m:
             continue
         clusters.append(Cluster(sx / n, sy / n, n, round(extent, 3)))
+
+    clusters = _merge_bodies(clusters, merge_m, max_extent_m + merge_m)
     clusters.sort(key=lambda c: c.range_m)
     return clusters
+
+
+def _merge_bodies(
+    clusters: list[Cluster], merge_m: float, max_extent_m: float
+) -> list[Cluster]:
+    """Greedily merge clusters whose centroids sit within one body's span
+    (legs, a swinging arm) into a single point-weighted cluster."""
+    merged = list(clusters)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                a, b = merged[i], merged[j]
+                if math.hypot(a.cx - b.cx, a.cy - b.cy) <= merge_m:
+                    n = a.n_points + b.n_points
+                    span = math.hypot(a.cx - b.cx, a.cy - b.cy)
+                    merged[i] = Cluster(
+                        (a.cx * a.n_points + b.cx * b.n_points) / n,
+                        (a.cy * a.n_points + b.cy * b.n_points) / n,
+                        n,
+                        round(min(max(a.extent_m, b.extent_m, span), max_extent_m), 3),
+                    )
+                    del merged[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return merged
 
 
 class BackgroundModel:
@@ -302,14 +338,23 @@ class AudienceTracker:
         self,
         *,
         match_gate_m: float = 0.9,
-        miss_timeout_s: float = 0.8,
+        # Coast unmatched tracks this long before declaring them dead — long
+        # enough to survive a walk behind furniture without fragmenting into a
+        # new track_id (which would double-count reach).
+        miss_timeout_s: float = 2.0,
         reuse_gate_m: float = 2.5,
+        # A dead track can be re-matched further away the longer it's been
+        # gone (people keep walking while unseen): gate grows at walking pace.
+        reuse_speed_m_s: float = 1.5,
+        reuse_gate_max_m: float = 5.0,
         encounter_cap_s: float = DEFAULT_ENCOUNTER_CAP_S,
         camera_confirm=None,   # callable(track) -> bool | None
     ) -> None:
         self.match_gate_m = match_gate_m
         self.miss_timeout_s = miss_timeout_s
         self.reuse_gate_m = reuse_gate_m
+        self.reuse_speed_m_s = reuse_speed_m_s
+        self.reuse_gate_max_m = reuse_gate_max_m
         self.encounter_cap_s = encounter_cap_s
         self._camera_confirm = camera_confirm
         self.tracks: list[Track] = []
@@ -376,10 +421,14 @@ class AudienceTracker:
         for ci in unmatched:
             c = clusters[ci]
             revived = None
-            best_d = self.reuse_gate_m
+            best_d = float("inf")
             for d in self._dead:
+                gate = min(
+                    self.reuse_gate_m + self.reuse_speed_m_s * (now - d.died_t),
+                    self.reuse_gate_max_m,
+                )
                 dist = math.hypot(c.cx - d.x, c.cy - d.y)
-                if dist <= best_d:
+                if dist <= gate and dist < best_d:
                     revived, best_d = d, dist
             if revived is not None:
                 self._dead.remove(revived)
