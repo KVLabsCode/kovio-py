@@ -247,7 +247,7 @@ def test_dwell_needs_to_be_close():
 # ----------------------------------------------------------- close approach --
 
 def _engine_with_walkin(now):
-    eng = AudienceEngine()
+    eng = AudienceEngine(warmup_s=0.0)
     eng.arm()
     t = now
     for i in range(25):  # person walks to 0.8 m in front
@@ -275,7 +275,7 @@ def test_close_approach_emits_with_lidar_coincidence():
 
 
 def test_no_close_approach_without_lidar_track():
-    eng = AudienceEngine()
+    eng = AudienceEngine(warmup_s=0.0)
     eng.arm()
     t = 2000.0
     for _ in range(30):  # hand over the lens: depth < 1 m, but lidar sees nobody
@@ -308,7 +308,7 @@ def test_engine_reset_on_arm_and_health():
 
 
 def test_disarmed_engine_queues_nothing():
-    eng = AudienceEngine()
+    eng = AudienceEngine(warmup_s=0.0)
     t = 4000.0
     for i in range(25):
         pts = np.array(_blob3d(4.0 - i * 0.13, 0.0), dtype=np.float32)
@@ -318,7 +318,7 @@ def test_disarmed_engine_queues_nothing():
 
 
 def test_take_passed_counts_movers_not_flicker():
-    eng = AudienceEngine()  # NOT armed — passed counting is always on
+    eng = AudienceEngine(warmup_s=0.0)  # NOT armed — passed counting is always on
     t = 6000.0
     # A static blob that flickers in and out never counts…
     for i in range(80):

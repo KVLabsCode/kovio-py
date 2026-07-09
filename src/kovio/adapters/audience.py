@@ -122,7 +122,11 @@ def extract_clusters(
     z_min: float = 0.15,
     z_max: float = 1.9,
     cell_m: float = 0.15,
-    min_points: int = 5,
+    # High enough to kill the flickering low-point remnants a mostly-
+    # background-absorbed static object sheds (observed live: those remnants
+    # dominated the cluster population, starved the ego fit, and churned
+    # tracks). A real body inside 4.5m returns far more than this per frame.
+    min_points: int = 15,
     min_extent_m: float = 0.08,
     max_extent_m: float = 1.2,
     # Grid components closer than this merge into one body: a mid-stride
@@ -296,8 +300,6 @@ class Track:
     # Leaky accumulated residual (ego-motion-corrected) displacement.
     resid_x: float = 0.0
     resid_y: float = 0.0
-    # Set on resurrection: the person already proved they move in a past life.
-    proven_mover: bool = False
     counted_passerby: bool = False
     # Continuous time within the dwell radius (with exit hysteresis).
     dwell_since: float | None = None
@@ -315,8 +317,10 @@ class Track:
 
     @property
     def eligible(self) -> bool:
-        if self.proven_mover:
-            return True
+        # Deliberately NOT inherited across resurrection: a returning person
+        # re-earns this within a step or two of walking, while a static
+        # remnant cluster mis-resurrected as a dead track never does (that
+        # bypass minted furniture passersby when tried).
         return math.hypot(self.resid_x, self.resid_y) >= MIN_TRAVEL_M
 
 
@@ -501,11 +505,11 @@ class AudienceTracker:
                     Track(
                         track_id=revived.track_id, born_t=now,
                         x=c.cx, y=c.cy, last_t=now, min_range_m=c.range_m,
-                        # Preserve what was already counted/emitted for this id.
+                        # Preserve what was already counted/emitted for this id
+                        # (dedup) — but NOT motion eligibility; see Track.eligible.
                         counted_passerby=revived.counted_passerby,
                         dwell_s=revived.dwell_s,
                         dwell_tier_idx=revived.dwell_tier_idx,
-                        proven_mover=True,
                     )
                 )
             else:
@@ -518,13 +522,11 @@ class AudienceTracker:
                 self._next_id += 1
 
         # 5) Fast-turn guard: a turn quicker than the match gate can follow
-        # kills and mass-resurrects tracks at their rotated positions. Those
-        # resurrections prove nothing about motion, and the dead pool's
-        # positions are in the OLD body frame — matching against it would
-        # resurrect the wrong things at the wrong offsets.
+        # kills and mass-resurrects tracks at their rotated positions. The
+        # dead pool's positions are in the OLD body frame — matching against
+        # it would resurrect the wrong things at the wrong offsets.
         if resurrections >= 3:
             for tr in self.tracks:
-                tr.proven_mover = False
                 tr.resid_x = tr.resid_y = 0.0
             self._dead.clear()
 
@@ -611,7 +613,12 @@ class AudienceEngine:
     session is open) so idle operation stores nothing.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, warmup_s: float = 45.0) -> None:
+        # No moments until the background model has had time to learn the
+        # static scene — the first minute after (re)start is when furniture
+        # still looks like bodies.
+        self.warmup_s = warmup_s
+        self._first_cloud_t: float | None = None
         self._lock = threading.Lock()
         self._background = BackgroundModel()
         self._tracker = AudienceTracker(camera_confirm=self._camera_confirms)
@@ -646,6 +653,8 @@ class AudienceEngine:
             log.exception("audience: cluster extraction failed")
             return []
         with self._lock:
+            if self._first_cloud_t is None:
+                self._first_cloud_t = now
             if self._last_cloud_t:
                 gap = max(now - self._last_cloud_t, 1e-3)
                 inst = 1.0 / gap
@@ -654,6 +663,8 @@ class AudienceEngine:
             self._clusters = clusters
             moments = self._tracker.update(clusters, now)
             moments.extend(self._close_approach(now))
+            if now - self._first_cloud_t < self.warmup_s:
+                moments = []  # background still learning; don't trust anything
             self._passed_accum += sum(1 for m in moments if m.kind == "passerby")
             if self._armed and moments:
                 # Stored as wire dicts so a failed upload can requeue verbatim;
