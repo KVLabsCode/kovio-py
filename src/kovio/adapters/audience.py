@@ -55,13 +55,17 @@ CLOSE_MIN_DURATION_S = 0.5
 # The D435i's horizontal FOV is ~87°; a lidar cluster within this half-angle of
 # straight ahead is "in the camera cone" for fusion checks.
 CAMERA_HALF_FOV_DEG = 50.0
-# A track must displace this far FROM ITS BIRTH POSITION to produce moments —
-# a pillar or parked cart never gets far from where it appeared, so static
-# clutter can't become a "passerby" even before the background model has
-# learned it. Net displacement, deliberately not path length: centroid jitter
-# on a static cluster accrues ~0.5 m/s of fake path (observed live) but never
-# moves the body anywhere.
+# A track must show this much OWN motion to produce moments, where "own" is
+# what remains after subtracting the scene's common rigid motion each frame.
+# Statics accrue nothing (jitter is zero-mean and the accumulator leaks); the
+# G1's balance steps and turns move the whole scene coherently and are
+# absorbed by the fitted transform (observed live: a turn made every piece of
+# furniture "walk" >0.4m in body frame); only a body actually moving through
+# the room accumulates residual displacement.
 MIN_TRAVEL_M = 0.4
+# Leak on the residual accumulator (~3s time constant at 10 Hz): random-walk
+# jitter saturates well below MIN_TRAVEL_M while a walker crosses it in ~0.3s.
+RESID_DECAY = 0.97
 DEFAULT_ENCOUNTER_CAP_S = 300.0
 
 
@@ -289,8 +293,9 @@ class Track:
     y: float
     last_t: float
     min_range_m: float
-    born_x: float = 0.0
-    born_y: float = 0.0
+    # Leaky accumulated residual (ego-motion-corrected) displacement.
+    resid_x: float = 0.0
+    resid_y: float = 0.0
     # Set on resurrection: the person already proved they move in a past life.
     proven_mover: bool = False
     counted_passerby: bool = False
@@ -312,7 +317,53 @@ class Track:
     def eligible(self) -> bool:
         if self.proven_mover:
             return True
-        return math.hypot(self.x - self.born_x, self.y - self.born_y) >= MIN_TRAVEL_M
+        return math.hypot(self.resid_x, self.resid_y) >= MIN_TRAVEL_M
+
+
+def _fit_rigid(pairs):
+    """Least-squares 2D rigid transform (rotation+translation) mapping each
+    (px, py) to (cx, cy). Returns f(px, py) -> (ex, ey), or None if degenerate.
+    ``pairs`` is a list of (px, py, cx, cy)."""
+    n = len(pairs)
+    if n < 3:
+        return None
+    mpx = sum(p[0] for p in pairs) / n
+    mpy = sum(p[1] for p in pairs) / n
+    mcx = sum(p[2] for p in pairs) / n
+    mcy = sum(p[3] for p in pairs) / n
+    sxx = sxy = syx = syy = 0.0
+    for px, py, cx, cy in pairs:
+        ax, ay, bx, by = px - mpx, py - mpy, cx - mcx, cy - mcy
+        sxx += ax * bx
+        sxy += ax * by
+        syx += ay * bx
+        syy += ay * by
+    theta = math.atan2(sxy - syx, sxx + syy)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    tx = mcx - (cos_t * mpx - sin_t * mpy)
+    ty = mcy - (sin_t * mpx + cos_t * mpy)
+
+    def f(px, py):
+        return cos_t * px - sin_t * py + tx, sin_t * px + cos_t * py + ty
+
+    return f
+
+
+def _fit_rigid_robust(pairs):
+    """Two-pass fit: fit all, drop outliers (a walker among statics), refit on
+    the majority so one real mover can't bias the scene's ego-motion estimate."""
+    f = _fit_rigid(pairs)
+    if f is None:
+        return None
+    resid = []
+    for px, py, cx, cy in pairs:
+        ex, ey = f(px, py)
+        resid.append(math.hypot(cx - ex, cy - ey))
+    cutoff = max(0.08, sorted(resid)[len(resid) // 2] * 2)
+    inliers = [p for p, r in zip(pairs, resid) if r <= cutoff]
+    if len(inliers) >= 3 and len(inliers) < len(pairs):
+        f = _fit_rigid(inliers) or f
+    return f
 
 
 @dataclass
@@ -385,10 +436,22 @@ class AudienceTracker:
                 matched[ti] = best
                 unmatched.remove(best)
 
-        # 2) Update matched tracks.
+        # 2) Update matched tracks. Ego-motion correction: fit the scene's
+        # common rigid motion this frame (robust to one real mover) and credit
+        # each track only with its RESIDUAL motion. The G1 balance-stepping or
+        # turning moves everything coherently -> absorbed by the fit; a person
+        # walking through the room keeps their own displacement.
+        pairs = [
+            (self.tracks[ti].x, self.tracks[ti].y, clusters[ci].cx, clusters[ci].cy)
+            for ti, ci in matched.items()
+        ]
+        ego = _fit_rigid_robust(pairs)
         for ti, ci in matched.items():
             tr = self.tracks[ti]
             c = clusters[ci]
+            ex, ey = ego(tr.x, tr.y) if ego is not None else (tr.x, tr.y)
+            tr.resid_x = tr.resid_x * RESID_DECAY + (c.cx - ex)
+            tr.resid_y = tr.resid_y * RESID_DECAY + (c.cy - ey)
             tr.x, tr.y = c.cx, c.cy
             tr.last_t = now
             tr.misses = 0
@@ -418,6 +481,7 @@ class AudienceTracker:
 
         # 4) Births — resurrect from the reuse pool inside the encounter cap so
         # the same person re-entering is NOT a second reach.
+        resurrections = 0
         for ci in unmatched:
             c = clusters[ci]
             revived = None
@@ -431,12 +495,12 @@ class AudienceTracker:
                 if dist <= gate and dist < best_d:
                     revived, best_d = d, dist
             if revived is not None:
+                resurrections += 1
                 self._dead.remove(revived)
                 self.tracks.append(
                     Track(
                         track_id=revived.track_id, born_t=now,
                         x=c.cx, y=c.cy, last_t=now, min_range_m=c.range_m,
-                        born_x=c.cx, born_y=c.cy,
                         # Preserve what was already counted/emitted for this id.
                         counted_passerby=revived.counted_passerby,
                         dwell_s=revived.dwell_s,
@@ -449,12 +513,22 @@ class AudienceTracker:
                     Track(
                         track_id=self._next_id, born_t=now,
                         x=c.cx, y=c.cy, last_t=now, min_range_m=c.range_m,
-                        born_x=c.cx, born_y=c.cy,
                     )
                 )
                 self._next_id += 1
 
-        # 5) Metric state machines.
+        # 5) Fast-turn guard: a turn quicker than the match gate can follow
+        # kills and mass-resurrects tracks at their rotated positions. Those
+        # resurrections prove nothing about motion, and the dead pool's
+        # positions are in the OLD body frame — matching against it would
+        # resurrect the wrong things at the wrong offsets.
+        if resurrections >= 3:
+            for tr in self.tracks:
+                tr.proven_mover = False
+                tr.resid_x = tr.resid_y = 0.0
+            self._dead.clear()
+
+        # 6) Metric state machines.
         for tr in self.tracks:
             moments.extend(self._passerby(tr, now))
             moments.extend(self._dwell(tr, now))

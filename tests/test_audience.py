@@ -163,6 +163,44 @@ def test_two_people_two_reaches():
     assert len(ids) == 2
 
 
+def _rotate(centres, deg):
+    a = math.radians(deg)
+    return [
+        (x * math.cos(a) - y * math.sin(a), x * math.sin(a) + y * math.cos(a))
+        for x, y in centres
+    ]
+
+
+def test_robot_turn_does_not_animate_the_furniture():
+    # Ego-motion regression: the G1 balance-steps/turns, displacing every
+    # static object in body frame at once. That must never mint passersby.
+    tr = AudienceTracker()
+    scene = [(2.0, 0.5), (1.2, -0.8), (3.0, 1.5), (2.5, -1.8), (3.5, 0.2)]
+    t, moments = 0.0, []
+    for _ in range(50):  # 5 s static
+        moments += tr.update(_clusters_at(*scene), t)
+        t += 0.1
+    for step in range(20):  # robot turns 40° over 2 s (2°/frame, coherent)
+        moments += tr.update(_clusters_at(*_rotate(scene, 2.0 * (step + 1))), t)
+        t += 0.1
+    for _ in range(100):  # 10 s settled again
+        moments += tr.update(_clusters_at(*_rotate(scene, 40.0)), t)
+        t += 0.1
+    assert moments == []
+
+
+def test_walker_still_counts_among_static_scene():
+    # One real mover among several statics must not be masked by the guard.
+    tr = AudienceTracker()
+    statics = [(2.0, 1.5), (3.0, -1.5), (3.5, 0.8)]
+    t, moments = 0.0, []
+    for i in range(60):
+        walker = (4.0 - i * 0.13, -0.5)
+        moments += tr.update(_clusters_at(*statics, walker), t)
+        t += 0.1
+    assert [m.kind for m in moments].count("passerby") == 1
+
+
 # -------------------------------------------------------------------- dwell --
 
 def _walk_in_and_stand(tr, stand_s, t0=0.0, stand_at=(1.0, 0.3)):
