@@ -498,6 +498,10 @@ class AudienceEngine:
         # Lidar liveness (EMA of inter-cloud gaps).
         self._last_cloud_t = 0.0
         self._hz = 0.0
+        # Movement-gated, dedup'd "passed by" counter (passerby moments,
+        # counted whether or not a session is armed) — replaces the flicker-
+        # prone frame-matching count for the scene payload's lidar_passed.
+        self._passed_accum = 0
 
     # -- lidar side ---------------------------------------------------------- #
 
@@ -519,6 +523,7 @@ class AudienceEngine:
             self._clusters = clusters
             moments = self._tracker.update(clusters, now)
             moments.extend(self._close_approach(now))
+            self._passed_accum += sum(1 for m in moments if m.kind == "passerby")
             if self._armed and moments:
                 # Stored as wire dicts so a failed upload can requeue verbatim;
                 # moment_id keeps retries idempotent server-side.
@@ -585,6 +590,14 @@ class AudienceEngine:
                 "depth_ok": depth_ok,
                 "tracks": len(self._tracker.tracks),
             }
+
+    def take_passed(self) -> int:
+        """Unique moving bodies that entered the field since the last call
+        (then reset). Same contract as LidarSource.take_passed, but tracked —
+        cluster flicker and background-model shifts can't inflate it."""
+        with self._lock:
+            n, self._passed_accum = self._passed_accum, 0
+        return n
 
     def latest_people(self) -> tuple[tuple[float, float], ...]:
         """(range_m, bearing_deg) per current cluster, nearest first — feeds

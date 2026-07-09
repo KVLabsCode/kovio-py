@@ -251,6 +251,28 @@ def test_disarmed_engine_queues_nothing():
     assert eng.drain() == []
 
 
+def test_take_passed_counts_movers_not_flicker():
+    eng = AudienceEngine()  # NOT armed — passed counting is always on
+    t = 6000.0
+    # A static blob that flickers in and out never counts…
+    for i in range(80):
+        pts = (
+            np.array(_blob3d(2.0, 1.0), dtype=np.float32)
+            if i % 3 != 0
+            else np.zeros((0, 3), dtype=np.float32)
+        )
+        eng.ingest_points(pts, now=t)
+        t += 0.1
+    assert eng.take_passed() == 0
+    # …a walker counts exactly once.
+    for i in range(30):
+        pts = np.array(_blob3d(4.0 - i * 0.13, 0.0), dtype=np.float32)
+        eng.ingest_points(pts, now=t)
+        t += 0.1
+    assert eng.take_passed() == 1
+    assert eng.take_passed() == 0  # drained
+
+
 def test_requeue_preserves_order_and_ids():
     eng, _ = _engine_with_walkin(5000.0)
     wire = eng.drain()

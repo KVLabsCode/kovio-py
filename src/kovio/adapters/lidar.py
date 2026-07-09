@@ -277,7 +277,13 @@ class LidarSource:
 
     def take_passed(self) -> int:
         """Unique bodies that ENTERED the lidar field since the last call, then
-        reset. Summed in the cloud into a cumulative "people passed by" count."""
+        reset. Summed in the cloud into a cumulative "people passed by" count.
+
+        With an engine attached this is the tracker's movement-gated passerby
+        count (immune to cluster flicker); the frame-matching accumulator is
+        the engine-less fallback."""
+        if self._engine is not None:
+            return self._engine.take_passed()
         with self._lock:
             n, self._passed_accum = self._passed_accum, 0
         return n
