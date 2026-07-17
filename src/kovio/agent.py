@@ -132,12 +132,26 @@ class KovioAgent:
         perception = kwargs.pop("perception", None) or make_perception_adapter()
         screen = kwargs.pop("screen", None) or make_screen_adapter()
 
-        # Admin live view: only when cloud-configured AND the adapter can hand
-        # over frames (rich/RealSense). Idle cost is one 5s poll; frames leave
-        # the robot only while an admin session is open.
+        # Text-to-speech adapter (kovio_tts binary when KOVIO_TTS_BIN is set,
+        # else a no-op logger). Best-effort: a misconfigured speaker must never
+        # stop the agent from coming up.
+        speaker = kwargs.pop("speaker", None)
+        if speaker is None:
+            from .adapters.audio import make_audio_adapter
+            try:
+                speaker = make_audio_adapter()
+            except Exception:
+                log.exception("audio adapter construction failed; speech disabled")
+                speaker = None
+
+        # Admin live view + dashboard TTS both ride the /session/v1/current
+        # poll, so we run the streamer whenever cloud-configured. Idle cost is
+        # one 5s poll; frames leave the robot only while a session is open, and
+        # only when the adapter can hand over frames (rich/RealSense) — a
+        # camera-only robot still polls so it can receive speak commands.
         session_streamer = kwargs.pop("session_streamer", None)
         frame_source = getattr(perception, "latest_frame_bgr", None)
-        if config.is_configured and session_streamer is None and frame_source is not None:
+        if config.is_configured and session_streamer is None:
             from .session_stream import SessionStreamer
             session_streamer = SessionStreamer(
                 api_url=config.api_url,
@@ -149,6 +163,7 @@ class KovioAgent:
                 # rich adapter in start(); None on camera-only adapters is fine —
                 # the streamer then only relays frames).
                 audience_engine=getattr(perception, "audience_engine", None),
+                speaker=speaker,
             )
 
         return cls(

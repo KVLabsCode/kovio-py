@@ -31,11 +31,12 @@ class SessionStreamer:
         api_url: str,
         api_key: str,
         robot_id: str,
-        frame_source: Callable[[], "object | None"],
+        frame_source: Callable[[], "object | None"] | None = None,
         poll_interval_seconds: float = 5.0,
         jpeg_quality: int = 70,
         timeout: float = _DEFAULT_TIMEOUT,
         audience_engine=None,
+        speaker=None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -49,6 +50,11 @@ class SessionStreamer:
         # with a sensor-health snapshot so the dashboard can show DEGRADED
         # instead of a silent zero when a sensor dies mid-session.
         self._engine = audience_engine
+        # Dashboard-driven TTS: the /current poll may carry a speak_text +
+        # speak_nonce; we hand the text to this AudioAdapter and de-dupe on the
+        # nonce so the 5s poll never repeats the same utterance.
+        self._speaker = speaker
+        self._last_speak_nonce: str | None = None
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -86,6 +92,10 @@ class SessionStreamer:
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout=self.timeout,
         )
+        # Dashboard TTS rides the same poll — dispatch before the frame work so
+        # a speak command lands even on a tick where there's no frame to encode.
+        self._maybe_speak(payload)
+
         active = bool(payload and payload.get("active"))
         if active != self._active:
             log.info("session %s", "OPEN — streaming frames" if active else "closed")
@@ -111,7 +121,29 @@ class SessionStreamer:
             return
         self._post_frame(jpeg)
 
+    def _maybe_speak(self, payload: "dict | None") -> None:
+        """Speak a dashboard-issued utterance from the /current payload, once.
+
+        The cloud surfaces ``speak_text`` + ``speak_nonce`` (and optional
+        ``speak_volume``) only while a session is open and a message is pending.
+        We de-dupe on the nonce so the recurring 5s poll speaks each message
+        exactly once. Never raises — a bad speaker/payload must not stall the
+        session loop."""
+        if self._speaker is None or not payload:
+            return
+        text = payload.get("speak_text")
+        nonce = payload.get("speak_nonce")
+        if not text or not nonce or nonce == self._last_speak_nonce:
+            return
+        self._last_speak_nonce = nonce
+        try:
+            self._speaker.speak(text, payload.get("speak_volume"))
+        except Exception:
+            log.exception("session.speak_failed")
+
     def _encode_latest(self) -> bytes | None:
+        if self._frame_source is None:
+            return None
         frame = self._frame_source()
         if frame is None:
             return None
