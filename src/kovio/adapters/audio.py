@@ -117,6 +117,86 @@ class LoggingAudioAdapter(AudioAdapter):
         log.info("[audio] SPEAK (vol=%s): %s", volume, text)
 
 
+class JblAudioPlayer:
+    """Play pre-rendered WAV (the cloud greeting) out a Bluetooth speaker.
+
+    Distinct from AudioAdapter.speak(): the greeting voice is synthesized in the
+    cloud (ElevenLabs), so here we just push finished WAV bytes to a PulseAudio
+    sink via ``paplay``. The sink is the JBL's A2DP sink, e.g.
+    ``bluez_sink.78_66_F3_81_16_D2.a2dp_sink``.
+
+    A2DP sinks suspend when idle and can clip the first ~200ms on resume, so we
+    play a short burst of silence first to wake the sink before the greeting.
+    Fire-and-forget with a watcher thread, mirroring KovioTtsAdapter, so the 5s
+    session poll never blocks on playback.
+    """
+
+    def __init__(self, sink: str, default_volume: int = 85) -> None:
+        self._sink = sink
+        self._default_volume = _clamp_volume(default_volume)
+
+    def play_wav(self, data: bytes, volume: int | None = None) -> None:
+        if not data:
+            return
+        vol = self._default_volume if volume is None else _clamp_volume(volume)
+        # paplay --volume is linear 0..65536.
+        pa_vol = str(int(round(vol / 100 * 65536)))
+        try:
+            self._wake_sink()
+            proc = subprocess.Popen(
+                ["paplay", "--device", self._sink, "--volume", pa_vol],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as e:
+            log.warning("[audio] could not launch paplay (sink=%s): %s", self._sink, e)
+            return
+        log.info("[audio] playing greeting (%d bytes, vol=%d) -> %s",
+                 len(data), vol, self._sink)
+        threading.Thread(
+            target=self._watch, args=(proc, data), name="kovio-jbl-play", daemon=True
+        ).start()
+
+    def _watch(self, proc: subprocess.Popen, data: bytes) -> None:
+        try:
+            _out, err = proc.communicate(input=data, timeout=_WATCH_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            log.warning("[audio] paplay timed out after %.0fs; killed", _WATCH_TIMEOUT_S)
+            return
+        if proc.returncode != 0:
+            log.warning(
+                "[audio] paplay exit=%s err=%s",
+                proc.returncode, (err or b"").decode("utf-8", "replace").strip()[:200],
+            )
+
+    def _wake_sink(self) -> None:
+        """Push ~0.3s of silence so the suspended A2DP sink is awake before the
+        real audio — otherwise the first word can be clipped on resume."""
+        # 0.3s of 16-bit mono silence at 22.05kHz, wrapped as WAV.
+        frames = b"\x00\x00" * int(22050 * 0.3)
+        import io as _io
+        import wave as _wave
+
+        buf = _io.BytesIO()
+        with _wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(22050)
+            w.writeframes(frames)
+        try:
+            subprocess.run(
+                ["paplay", "--device", self._sink],
+                input=buf.getvalue(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass  # best-effort wake; the greeting still plays
+
+
 def _clamp_volume(value: int) -> int:
     try:
         return max(0, min(100, int(value)))
@@ -161,3 +241,19 @@ def make_audio_adapter(name: str | None = None) -> AudioAdapter:
 
     # No name and no binary configured: dev machine / camera-only robot.
     return LoggingAudioAdapter()
+
+
+def make_audio_player() -> "JblAudioPlayer | None":
+    """Construct the Bluetooth greeting player, or None if not configured.
+
+    Env:
+      KOVIO_JBL_SINK    PulseAudio sink name of the paired speaker, e.g.
+                        ``bluez_sink.78_66_F3_81_16_D2.a2dp_sink``. Unset =>
+                        greeting audio is simply not played (feature disabled).
+      KOVIO_JBL_VOLUME  default playback volume 0-100 (default 85)
+    """
+    sink = os.getenv("KOVIO_JBL_SINK")
+    if not sink:
+        return None
+    volume = _clamp_volume(os.getenv("KOVIO_JBL_VOLUME", "85"))
+    return JblAudioPlayer(sink=sink, default_volume=volume)

@@ -144,6 +144,33 @@ class KovioAgent:
                 log.exception("audio adapter construction failed; speech disabled")
                 speaker = None
 
+        # Greeting-on-Go player: plays cloud-rendered WAV out the paired
+        # Bluetooth speaker (KOVIO_JBL_SINK). None when unconfigured — the
+        # session streamer then just uses onboard TTS for any speak_text.
+        player = kwargs.pop("player", None)
+        if player is None:
+            from .adapters.audio import make_audio_player
+            try:
+                player = make_audio_player()
+            except Exception:
+                log.exception("audio player construction failed; greeting disabled")
+                player = None
+
+        # Push-to-talk conversation: mic capture + local ASR (both gated on
+        # KOVIO_ASR). None when disabled — the streamer then ignores any
+        # listen_nonce. Best-effort: never block agent bringup.
+        mic = kwargs.pop("mic", None)
+        asr = kwargs.pop("asr", None)
+        if mic is None or asr is None:
+            try:
+                from .adapters.asr import make_asr
+                from .adapters.mic import make_mic_capture
+                mic = mic or make_mic_capture()
+                asr = asr or make_asr()
+            except Exception:
+                log.exception("conversation adapters failed; push-to-talk disabled")
+                mic = asr = None
+
         # Admin live view + dashboard TTS both ride the /session/v1/current
         # poll, so we run the streamer whenever cloud-configured. Idle cost is
         # one 5s poll; frames leave the robot only while a session is open, and
@@ -164,6 +191,9 @@ class KovioAgent:
                 # the streamer then only relays frames).
                 audience_engine=getattr(perception, "audience_engine", None),
                 speaker=speaker,
+                player=player,
+                mic=mic,
+                asr=asr,
             )
 
         return cls(

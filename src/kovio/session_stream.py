@@ -37,6 +37,9 @@ class SessionStreamer:
         timeout: float = _DEFAULT_TIMEOUT,
         audience_engine=None,
         speaker=None,
+        player=None,
+        mic=None,
+        asr=None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -54,7 +57,20 @@ class SessionStreamer:
         # speak_nonce; we hand the text to this AudioAdapter and de-dupe on the
         # nonce so the 5s poll never repeats the same utterance.
         self._speaker = speaker
+        # Greeting-on-Go: the /current poll may instead carry a speak_audio_url
+        # (a cloud-rendered ElevenLabs WAV). When present we fetch it and play it
+        # out the Bluetooth speaker via this player, in preference to onboard
+        # TTS. Shares the same nonce de-dup as speak_text.
+        self._player = player
         self._last_speak_nonce: str | None = None
+        # Push-to-talk: when the /current poll carries a listen_nonce we capture
+        # one mic utterance (mic), transcribe it on-device (asr), POST the text
+        # to /utterance, and play the reply WAV out the speaker (player). The
+        # turn runs on its own thread so the 5s poll never blocks on it.
+        self._mic = mic
+        self._asr = asr
+        self._last_listen_nonce: str | None = None
+        self._listening = False
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -95,6 +111,8 @@ class SessionStreamer:
         # Dashboard TTS rides the same poll — dispatch before the frame work so
         # a speak command lands even on a tick where there's no frame to encode.
         self._maybe_speak(payload)
+        # Push-to-talk conversation rides the same poll too.
+        self._maybe_listen(payload)
 
         active = bool(payload and payload.get("active"))
         if active != self._active:
@@ -129,17 +147,109 @@ class SessionStreamer:
         We de-dupe on the nonce so the recurring 5s poll speaks each message
         exactly once. Never raises — a bad speaker/payload must not stall the
         session loop."""
-        if self._speaker is None or not payload:
+        if not payload:
             return
-        text = payload.get("speak_text")
         nonce = payload.get("speak_nonce")
-        if not text or not nonce or nonce == self._last_speak_nonce:
+        if not nonce or nonce == self._last_speak_nonce:
+            return
+
+        # Prefer a cloud-rendered greeting WAV (natural voice, Bluetooth speaker)
+        # over onboard text TTS. Both de-dupe on the same nonce.
+        audio_url = payload.get("speak_audio_url")
+        if audio_url and self._player is not None:
+            self._last_speak_nonce = nonce
+            try:
+                data = self._fetch_audio(audio_url)
+                if data:
+                    self._player.play_wav(data, payload.get("speak_volume"))
+            except Exception:
+                log.exception("session.play_audio_failed")
+            return
+
+        text = payload.get("speak_text")
+        if not text or self._speaker is None:
             return
         self._last_speak_nonce = nonce
         try:
             self._speaker.speak(text, payload.get("speak_volume"))
         except Exception:
             log.exception("session.speak_failed")
+
+    def _maybe_listen(self, payload: "dict | None") -> None:
+        """Handle a push-to-talk listening window from the /current payload.
+
+        On each new ``listen_nonce`` we run one conversation turn on a worker
+        thread (capture -> transcribe -> reply -> play) so the poll keeps
+        running. Only one turn at a time; de-dupes on the nonce. Never raises."""
+        if self._mic is None or self._asr is None or not payload:
+            return
+        nonce = payload.get("listen_nonce")
+        if not nonce or nonce == self._last_listen_nonce or self._listening:
+            return
+        self._last_listen_nonce = nonce
+        self._listening = True
+        threading.Thread(
+            target=self._run_listen_turn, args=(nonce,),
+            name="kovio-listen", daemon=True,
+        ).start()
+
+    def _run_listen_turn(self, nonce: str) -> None:
+        try:
+            pcm = self._mic.record_utterance()
+            if not pcm:
+                return
+            text = self._asr.transcribe(pcm)
+            if not text:
+                return
+            wav = self._post_utterance(text, nonce)
+            if wav and self._player is not None:
+                self._player.play_wav(wav)
+        except Exception:
+            log.exception("session.listen_turn_failed")
+        finally:
+            self._listening = False
+
+    def _post_utterance(self, text: str, nonce: str) -> bytes | None:
+        """POST recognized text to /utterance; return the reply WAV bytes."""
+        import json
+
+        qs = parse.urlencode({"robot_id": self.robot_id})
+        body = json.dumps({"text": text, "nonce": nonce}).encode("utf-8")
+        req = request.Request(
+            f"{self.api_url}/session/v1/utterance?{qs}", data=body, method="POST"
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with request.urlopen(req, timeout=self.timeout) as resp:
+                reply = resp.headers.get("X-Reply-Text")
+                if reply:
+                    log.info("session.reply: %r", reply[:80])
+                return resp.read()
+        except error.HTTPError as e:
+            # 409 = session closed; 503 = reply generation off/errored.
+            if e.code not in (409, 503):
+                log.warning("session.utterance.http_error status=%s", e.code)
+        except (error.URLError, TimeoutError, OSError) as e:
+            log.warning("session.utterance.network_error %s", e)
+        return None
+
+    def _fetch_audio(self, path: str) -> bytes | None:
+        """GET the pending greeting WAV (fleet-key auth). ``path`` is the
+        relative URL the cloud handed us on the poll."""
+        url = path if path.startswith("http") else f"{self.api_url}{path}"
+        req = request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        try:
+            with request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.read()
+        except error.HTTPError as e:
+            # 404 = greeting expired/superseded between the poll and the fetch.
+            if e.code != 404:
+                log.warning("session.audio.http_error status=%s", e.code)
+        except (error.URLError, TimeoutError, OSError) as e:
+            log.warning("session.audio.network_error %s", e)
+        return None
 
     def _encode_latest(self) -> bytes | None:
         if self._frame_source is None:
