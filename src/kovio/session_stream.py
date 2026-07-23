@@ -23,6 +23,20 @@ from .cloud import _DEFAULT_TIMEOUT, _get_json
 log = logging.getLogger("kovio.session")
 
 
+def _wav_duration(wav: bytes) -> float:
+    """Seconds of audio in a WAV blob, for pacing the conversation loop so the
+    mic doesn't re-open while the reply is still playing. Falls back to 3s."""
+    try:
+        import io
+        import wave
+
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            rate = w.getframerate() or 22050
+            return w.getnframes() / float(rate)
+    except Exception:
+        return 3.0
+
+
 class SessionStreamer:
     """Background thread: poll for an open session, stream frames while one is."""
 
@@ -32,7 +46,7 @@ class SessionStreamer:
         api_key: str,
         robot_id: str,
         frame_source: Callable[[], "object | None"] | None = None,
-        poll_interval_seconds: float = 5.0,
+        poll_interval_seconds: float = 2.5,
         jpeg_quality: int = 70,
         timeout: float = _DEFAULT_TIMEOUT,
         audience_engine=None,
@@ -63,14 +77,12 @@ class SessionStreamer:
         # TTS. Shares the same nonce de-dup as speak_text.
         self._player = player
         self._last_speak_nonce: str | None = None
-        # Push-to-talk: when the /current poll carries a listen_nonce we capture
-        # one mic utterance (mic), transcribe it on-device (asr), POST the text
-        # to /utterance, and play the reply WAV out the speaker (player). The
-        # turn runs on its own thread so the 5s poll never blocks on it.
+        # Conversation mode: when the /current poll reports conversation_active,
+        # the robot runs a continuous loop (listen -> transcribe -> reply ->
+        # play -> repeat) on its own thread until the flag clears.
         self._mic = mic
         self._asr = asr
-        self._last_listen_nonce: str | None = None
-        self._listening = False
+        self._convo_active = False
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -176,38 +188,52 @@ class SessionStreamer:
             log.exception("session.speak_failed")
 
     def _maybe_listen(self, payload: "dict | None") -> None:
-        """Handle a push-to-talk listening window from the /current payload.
-
-        On each new ``listen_nonce`` we run one conversation turn on a worker
-        thread (capture -> transcribe -> reply -> play) so the poll keeps
-        running. Only one turn at a time; de-dupes on the nonce. Never raises."""
+        """Enter or leave continuous conversation mode based on the poll's
+        ``conversation_active`` flag. The loop runs on its own thread so the
+        poll keeps flowing (and can deliver the 'ended' signal). Never raises."""
         if self._mic is None or self._asr is None or not payload:
             return
-        nonce = payload.get("listen_nonce")
-        if not nonce or nonce == self._last_listen_nonce or self._listening:
-            return
-        self._last_listen_nonce = nonce
-        self._listening = True
-        threading.Thread(
-            target=self._run_listen_turn, args=(nonce,),
-            name="kovio-listen", daemon=True,
-        ).start()
+        active = bool(payload.get("conversation_active"))
+        if active and not self._convo_active:
+            self._convo_active = True
+            threading.Thread(
+                target=self._conversation_loop, name="kovio-convo", daemon=True
+            ).start()
+            log.info("conversation.entered")
+        elif not active and self._convo_active:
+            # Cleared by the dashboard 'End' button / idle timeout / stop. The
+            # loop's should_abort sees this and exits promptly.
+            self._convo_active = False
+            log.info("conversation.exiting")
 
-    def _run_listen_turn(self, nonce: str) -> None:
+    def _conversation_loop(self) -> None:
+        """Continuous listen -> transcribe -> reply -> play, until the poll
+        clears conversation_active. Sequential by design: we wait out our own
+        reply playback before listening again, so the mic never captures the
+        robot's own voice (no self-conversation)."""
+        abort = lambda: (not self._convo_active) or self._stop.is_set()
         try:
-            pcm = self._mic.record_utterance()
-            if not pcm:
-                return
-            text = self._asr.transcribe(pcm)
-            if not text:
-                return
-            wav = self._post_utterance(text, nonce)
-            if wav and self._player is not None:
-                self._player.play_wav(wav)
+            while not abort():
+                pcm = self._mic.record_utterance(
+                    start_timeout=20.0, trailing_silence=1.0, should_abort=abort,
+                )
+                if abort():
+                    break
+                if not pcm:
+                    continue  # nobody spoke this window; re-arm and keep waiting
+                text = self._asr.transcribe(pcm)
+                if not text:
+                    continue
+                wav = self._post_utterance(text, "conversation")
+                if wav and self._player is not None:
+                    self._player.play_wav(wav)
+                    # Hold off listening until our reply finishes playing.
+                    self._stop.wait(_wav_duration(wav) + 0.5)
         except Exception:
-            log.exception("session.listen_turn_failed")
+            log.exception("session.conversation_loop_failed")
         finally:
-            self._listening = False
+            self._convo_active = False
+            log.info("conversation.ended")
 
     def _post_utterance(self, text: str, nonce: str) -> bytes | None:
         """POST recognized text to /utterance; return the reply WAV bytes."""

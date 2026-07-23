@@ -56,15 +56,17 @@ class MicCapture:
     def record_utterance(
         self,
         max_seconds: float = 12.0,
-        start_timeout: float = 6.0,
+        start_timeout: float = 15.0,
         trailing_silence: float = 1.2,
-        min_speech_seconds: float = 0.3,
+        min_speech_seconds: float = 0.2,
+        should_abort=None,
     ) -> bytes:
         """Capture one utterance as raw PCM16 bytes (may be b"" if nothing said).
 
         Records until ``trailing_silence`` of quiet follows detected speech, or
         ``max_seconds`` elapses. Gives up (returns b"") if no speech starts
-        within ``start_timeout``.
+        within ``start_timeout``. If ``should_abort`` is given and returns True
+        (e.g. conversation mode was ended), the capture aborts promptly.
         """
         try:
             sock = self._open()
@@ -82,6 +84,8 @@ class MicCapture:
         try:
             while True:
                 now = time.time()
+                if should_abort is not None and should_abort():
+                    return b""
                 if now - t0 > max_seconds:
                     break
                 if not started and now - t0 > start_timeout:
